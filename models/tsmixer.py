@@ -32,7 +32,7 @@ def res_block(inputs, norm_type, activation, dropout, ff_dim):
   return x + res
 
 
-def build_model(
+def Model(
     input_shape,
     pred_len,
     norm_type,
