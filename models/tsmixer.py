@@ -1,17 +1,15 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # =========================
-# TSMixer Block (Fixed)
+# TSMixer Block (FIXED)
 # =========================
 class TSMixerBlock(nn.Module):
     def __init__(
         self,
-        seq_len ,
-        pred_len ,
-        enc_in ,
-        num_features,
+        seq_len,
         ff_dim=2048,
         dropout=0.1,
         norm_type="L",
@@ -20,27 +18,24 @@ class TSMixerBlock(nn.Module):
         super().__init__()
 
         self.seq_len = seq_len
-        self.num_features = num_features
 
-        # normalization
+        # normalization (feature-wise)
         if norm_type == "L":
-            self.norm1 = nn.LayerNorm(num_features)
-            self.norm2 = nn.LayerNorm(num_features)
+            self.norm1 = nn.LayerNorm(seq_len)
+            self.norm2 = nn.LayerNorm(seq_len)
         else:
-            self.norm1 = nn.BatchNorm1d(num_features)
-            self.norm2 = nn.BatchNorm1d(num_features)
-
-        # activation
-        self.act = getattr(torch.nn.functional, activation)
+            self.norm1 = nn.BatchNorm1d(seq_len)
+            self.norm2 = nn.BatchNorm1d(seq_len)
 
         self.dropout = nn.Dropout(dropout)
+        self.act = getattr(F, activation)
 
-        # Temporal mixing (mix along time axis)
+        # Temporal mixing (mix time dimension)
         self.temporal_fc = nn.Linear(seq_len, seq_len)
 
         # Feature mixing (MLP per time step)
-        self.fc1 = nn.Linear(num_features, ff_dim)
-        self.fc2 = nn.Linear(ff_dim, num_features)
+        self.fc1 = nn.Linear(seq_len, ff_dim)
+        self.fc2 = nn.Linear(ff_dim, seq_len)
 
     def forward(self, x):
         # x: [B, L, C]
@@ -49,20 +44,15 @@ class TSMixerBlock(nn.Module):
         # =========================
         # Temporal Mixing
         # =========================
-        y = x.transpose(1, 2)              # [B, C, L]
-        y = self.temporal_fc(y)            # mix time dimension
-        y = y.transpose(1, 2)              # [B, L, C]
+        y = x.transpose(1, 2)      # [B, C, L]
+        y = self.temporal_fc(y)    # mix time
+        y = y.transpose(1, 2)      # [B, L, C]
         y = self.dropout(y)
 
         x = residual + y
 
-        # optional norm (stable training)
-        if isinstance(self.norm1, nn.LayerNorm):
-            x = self.norm1(x)
-        else:
-            x = x.transpose(1, 2)
-            x = self.norm1(x)
-            x = x.transpose(1, 2)
+        # LayerNorm over last dim
+        x = self.norm1(x)
 
         # =========================
         # Feature Mixing
@@ -77,20 +67,13 @@ class TSMixerBlock(nn.Module):
         y = self.dropout(y)
 
         x = residual + y
-
-        # optional norm
-        if isinstance(self.norm2, nn.LayerNorm):
-            x = self.norm2(x)
-        else:
-            x = x.transpose(1, 2)
-            x = self.norm2(x)
-            x = x.transpose(1, 2)
+        x = self.norm2(x)
 
         return x
 
 
 # =========================
-# Full TSMixer Model (Fixed)
+# Full Model
 # =========================
 class Model(nn.Module):
     def __init__(
@@ -109,12 +92,13 @@ class Model(nn.Module):
 
         self.seq_len = seq_len
         self.pred_len = pred_len
+        self.enc_in = enc_in
         self.target_slice = target_slice
 
+        # stack blocks
         self.blocks = nn.ModuleList([
             TSMixerBlock(
                 seq_len=seq_len,
-                num_features=enc_in,
                 ff_dim=ff_dim,
                 dropout=dropout,
                 norm_type=norm_type,
@@ -123,7 +107,7 @@ class Model(nn.Module):
             for _ in range(n_block)
         ])
 
-        # projection: map time -> prediction horizon
+        # temporal projection (L → pred_len)
         self.proj = nn.Linear(seq_len, pred_len)
 
     def forward(self, x):
@@ -136,13 +120,13 @@ class Model(nn.Module):
         if self.target_slice is not None:
             x = x[:, :, self.target_slice]
 
-        # [B, L, C] -> [B, C, L]
+        # [B, L, C] → [B, C, L]
         x = x.permute(0, 2, 1)
 
-        # temporal projection
+        # project time dimension
         x = self.proj(x)
 
-        # [B, C, pred_len] -> [B, pred_len, C]
+        # [B, C, pred_len] → [B, pred_len, C]
         x = x.permute(0, 2, 1)
 
         return x
