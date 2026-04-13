@@ -8,7 +8,9 @@ import torch.nn as nn
 class TSMixerBlock(nn.Module):
     def __init__(
         self,
-        seq_len,
+        seq_len = args.seq_len
+        pred_len = args.pred_len
+        enc_in = args.enc_in
         num_features,
         ff_dim=2048,
         dropout=0.1,
