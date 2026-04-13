@@ -10,6 +10,7 @@ class TSMixerBlock(nn.Module):
     def __init__(
         self,
         seq_len,
+        enc_in,
         ff_dim=2048,
         dropout=0.1,
         norm_type="L",
@@ -18,24 +19,33 @@ class TSMixerBlock(nn.Module):
         super().__init__()
 
         self.seq_len = seq_len
+        self.enc_in = enc_in
 
-        # normalization (feature-wise)
+        # =========================
+        # Normalization (FEATURE dim)
+        # =========================
         if norm_type == "L":
-            self.norm1 = nn.LayerNorm(seq_len)
-            self.norm2 = nn.LayerNorm(seq_len)
+            self.norm1 = nn.LayerNorm(enc_in)
+            self.norm2 = nn.LayerNorm(enc_in)
         else:
-            self.norm1 = nn.BatchNorm1d(seq_len)
-            self.norm2 = nn.BatchNorm1d(seq_len)
+            self.norm1 = nn.BatchNorm1d(enc_in)
+            self.norm2 = nn.BatchNorm1d(enc_in)
 
         self.dropout = nn.Dropout(dropout)
-        self.act = getattr(F, activation)
 
-        # Temporal mixing (mix time dimension)
+        # activation
+        self.act = F.gelu if activation == "gelu" else F.relu
+
+        # =========================
+        # Temporal mixing (over time)
+        # =========================
         self.temporal_fc = nn.Linear(seq_len, seq_len)
 
-        # Feature mixing (MLP per time step)
-        self.fc1 = nn.Linear(seq_len, ff_dim)
-        self.fc2 = nn.Linear(ff_dim, seq_len)
+        # =========================
+        # Feature mixing (over channels)
+        # =========================
+        self.fc1 = nn.Linear(enc_in, ff_dim)
+        self.fc2 = nn.Linear(ff_dim, enc_in)
 
     def forward(self, x):
         # x: [B, L, C]
@@ -45,14 +55,10 @@ class TSMixerBlock(nn.Module):
         # Temporal Mixing
         # =========================
         y = x.transpose(1, 2)      # [B, C, L]
-        y = self.temporal_fc(y)    # mix time
+        y = self.temporal_fc(y)    # mix time dimension
         y = y.transpose(1, 2)      # [B, L, C]
-        y = self.dropout(y)
 
-        x = residual + y
-
-        # LayerNorm over last dim
-        x = self.norm1(x)
+        x = self.norm1(residual + self.dropout(y))
 
         # =========================
         # Feature Mixing
@@ -66,14 +72,13 @@ class TSMixerBlock(nn.Module):
         y = self.fc2(y)
         y = self.dropout(y)
 
-        x = residual + y
-        x = self.norm2(x)
+        x = self.norm2(residual + y)
 
         return x
 
 
 # =========================
-# Full Model
+# Full TSMixer Model
 # =========================
 class Model(nn.Module):
     def __init__(
@@ -99,6 +104,7 @@ class Model(nn.Module):
         self.blocks = nn.ModuleList([
             TSMixerBlock(
                 seq_len=seq_len,
+                enc_in=enc_in,
                 ff_dim=ff_dim,
                 dropout=dropout,
                 norm_type=norm_type,
