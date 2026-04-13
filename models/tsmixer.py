@@ -70,9 +70,9 @@ class Model(nn.Module):
         pred_len,
         norm_type='L',
         activation='gelu',
-        n_block=4,
-        dropout=0.1,
-        ff_dim=256,
+        n_block=2,
+        dropout=0.05,
+        ff_dim=2048,
         target_slice=None,
     ):
         super().__init__()
