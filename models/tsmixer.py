@@ -10,7 +10,7 @@ import torch.nn as nn
 # =========================
 class TSMixerBlock(nn.Module):
     def __init__(self, seq_len, hidden_dim, norm_type='L', activation='gelu',
-                 dropout=0.1, ff_dim=256):
+                 dropout=0.05, ff_dim=2048):
         super().__init__()
 
         self.norm_type = norm_type
