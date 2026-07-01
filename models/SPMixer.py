@@ -273,7 +273,7 @@ class Backbone(nn.Module):
         # ---------------------------------------------------------------
         # Statistical Router / Adaptive Fusion (optional, config-gated)
         # ---------------------------------------------------------------
-        self.use_stat_router = getattr(configs, 'use_stat_router', False)
+        self.use_stat_router = getattr(configs, 'use_stat_router', True)
         if self.use_stat_router:
             stat_period = getattr(configs, 'stat_period', 24)
             stat_embed_dim = getattr(configs, 'stat_embed_dim', 16)
