@@ -524,7 +524,7 @@ class Backbone(nn.Module):
         # -----------------------------------------------------------------------
         # Dynamic Statistical Routing (optional — enable via configs.use_stat_router)
         # -----------------------------------------------------------------------
-        self.use_stat_router = getattr(configs, 'use_stat_router', False)
+        self.use_stat_router = getattr(configs, 'use_stat_router', True)
 
         if self.use_stat_router:
             # Config knobs (all have safe defaults)
