@@ -1,60 +1,187 @@
 # coding=utf-8
-"""Implementation of TSMixer (fixed for Keras compatibility)."""
+"""
+PyTorch implementation of TSMixer
+Compatible with PatchMixer / PyTorch training pipeline.
+"""
 
-import tensorflow as tf
-from tensorflow.keras import layers
-
-
-def res_block(inputs, norm_type, activation, dropout, ff_dim):
-  """Residual block of TSMixer."""
-
-  norm = (
-      layers.LayerNormalization
-      if norm_type == 'L'
-      else layers.BatchNormalization
-  )
-
-  # Temporal Linear
-  x = layers.Permute((2, 1))(inputs)  # [Batch, Channel, Input Length]
-
-  # هنا نستعمل inputs.shape[-1] (قيمة ثابتة) مش tf.shape
-  x = layers.Dense(inputs.shape[1], activation=activation)(x)
-
-  x = layers.Permute((2, 1))(x)       # [Batch, Input Length, Channel]
-  x = layers.Dropout(dropout)(x)
-  res = x + inputs
-
-  # Feature Linear
-  x = layers.Dense(ff_dim, activation=activation)(res)
-  x = layers.Dropout(dropout)(x)
-  x = layers.Dense(inputs.shape[-1])(x)  # [Batch, Input Length, Channel]
-  x = layers.Dropout(dropout)(x)
-  return x + res
+import torch
+import torch.nn as nn
 
 
-def Model(
-    input_shape,
-    pred_len,
-    norm_type,
-    activation,
-    n_block,
-    dropout,
-    ff_dim,
-    target_slice,
-):
-  """Build TSMixer model."""
+class ResBlock(nn.Module):
+    """
+    TSMixer residual block.
 
-  inputs = tf.keras.Input(shape=input_shape)
-  x = inputs  # [Batch, Input Length, Channel]
-  for _ in range(n_block):
-    x = res_block(x, norm_type, activation, dropout, ff_dim)
+    Input:
+        [B, L, C]
 
-  if target_slice:
-    x = x[:, :, target_slice]
+    Output:
+        [B, L, C]
+    """
 
-  # بدل tf.transpose -> Permute
-  x = layers.Permute((2, 1))(x)       # [Batch, Channel, Input Length]
-  x = layers.Dense(pred_len)(x)       # [Batch, Channel, Output Length]
-  outputs = layers.Permute((2, 1))(x) # [Batch, Output Length, Channel]
-  return tf.keras.Model(inputs, outputs)
+    def __init__(
+        self,
+        seq_len,
+        n_channels,
+        norm_type='L',
+        activation='relu',
+        dropout=0.2,
+        ff_dim=2048
+    ):
+        super().__init__()
 
+        # -------------------------------------------------
+        # Normalization
+        # -------------------------------------------------
+        if norm_type == 'L':
+            self.norm1 = nn.LayerNorm(n_channels)
+            self.norm2 = nn.LayerNorm(n_channels)
+        else:
+            self.norm1 = nn.BatchNorm1d(n_channels)
+            self.norm2 = nn.BatchNorm1d(n_channels)
+
+        # -------------------------------------------------
+        # Activation
+        # -------------------------------------------------
+        if activation.lower() == 'relu':
+            act = nn.ReLU()
+        elif activation.lower() == 'gelu':
+            act = nn.GELU()
+        elif activation.lower() == 'silu':
+            act = nn.SiLU()
+        else:
+            act = nn.ReLU()
+
+        # -------------------------------------------------
+        # Temporal Linear
+        #
+        # [B, L, C]
+        # -> [B, C, L]
+        # -> Linear(L, L)
+        # -> [B, L, C]
+        # -------------------------------------------------
+        self.temporal_mlp = nn.Sequential(
+            nn.Linear(seq_len, seq_len),
+            act,
+            nn.Dropout(dropout)
+        )
+
+        # -------------------------------------------------
+        # Feature Linear
+        # -------------------------------------------------
+        self.feature_mlp = nn.Sequential(
+            nn.Linear(n_channels, ff_dim),
+            act,
+            nn.Dropout(dropout),
+            nn.Linear(ff_dim, n_channels),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+
+        # =================================================
+        # Temporal Mixing
+        # =================================================
+
+        residual = x
+
+        x = self.norm1(x)
+
+        # [B, L, C] -> [B, C, L]
+        x = x.transpose(1, 2)
+
+        # Temporal MLP
+        x = self.temporal_mlp(x)
+
+        # [B, C, L] -> [B, L, C]
+        x = x.transpose(1, 2)
+
+        x = x + residual
+
+        # =================================================
+        # Feature Mixing
+        # =================================================
+
+        residual = x
+
+        x = self.norm2(x)
+
+        x = self.feature_mlp(x)
+
+        x = x + residual
+
+        return x
+
+
+class Model(nn.Module):
+    """
+    TSMixer model compatible with PatchMixer Exp_Main.
+
+    Input:
+        [B, seq_len, enc_in]
+
+    Output:
+        [B, pred_len, enc_in]
+    """
+
+    def __init__(self, args):
+        super(Model, self).__init__()
+
+        self.seq_len = args.seq_len
+        self.pred_len = args.pred_len
+        self.enc_in = args.enc_in
+
+        self.norm_type = args.norm_type
+        self.activation = args.activation
+        self.n_block = args.n_block
+        self.dropout = args.dropout
+        self.ff_dim = args.ff_dim
+
+        # -------------------------------------------------
+        # TSMixer blocks
+        # -------------------------------------------------
+
+        self.blocks = nn.ModuleList([
+            ResBlock(
+                seq_len=self.seq_len,
+                n_channels=self.enc_in,
+                norm_type=self.norm_type,
+                activation=self.activation,
+                dropout=self.dropout,
+                ff_dim=self.ff_dim
+            )
+            for _ in range(self.n_block)
+        ])
+
+        # -------------------------------------------------
+        # Forecasting head
+        #
+        # [B, L, C]
+        # -> [B, C, L]
+        # -> Dense(L -> pred_len)
+        # -> [B, pred_len, C]
+        # -------------------------------------------------
+
+        self.forecast = nn.Linear(
+            self.seq_len,
+            self.pred_len
+        )
+
+    def forward(self, x):
+
+        # x:
+        # [B, seq_len, enc_in]
+
+        for block in self.blocks:
+            x = block(x)
+
+        # [B, L, C] -> [B, C, L]
+        x = x.transpose(1, 2)
+
+        # [B, C, L] -> [B, C, pred_len]
+        x = self.forecast(x)
+
+        # [B, C, pred_len] -> [B, pred_len, C]
+        x = x.transpose(1, 2)
+
+        return x
