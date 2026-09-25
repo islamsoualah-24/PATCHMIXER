@@ -1,336 +1,825 @@
-__all__ = ['PatchMixer']
+__all__ = ['Model']
 
-# Cell
 import torch
 from torch import nn
-from torch import Tensor
 import torch.nn.functional as F
-import numpy as np
+
 from layers.PatchTST_layers import *
 from layers.RevIN import RevIN
 
 
-# =============================================================================
-# Statistical Profiling Module
-# =============================================================================
-class StatisticalProfiler(nn.Module):
-    """
-    Computes global statistical descriptors from the raw input window, per
-    sample in the batch. All operations are differentiable (built from
-    mean / var / fft / corrcoef-style primitives) so the resulting vector
-    can be backpropagated through if needed, even though in practice it is
-    treated as a conditioning signal.
+# ============================================================
+# 1. PatchMixer Block
+# ============================================================
 
-    Input:  x [B, L, N]   (batch, seq_len, n_vars) -- pre-RevIN raw window
-    Output: stats [B, 4]  -> (Trend Strength, Seasonality Strength,
-                               Distribution Shift, Multivariate Correlation Index)
-    """
-    def __init__(self, period: int = 24, eps: float = 1e-6):
-        super().__init__()
-        self.period = period
-        self.eps = eps
-
-    @staticmethod
-    def _moving_average(x: Tensor, window: int) -> Tensor:
-        # x: [B, L, N] -> trend via 1D average pooling along time, same length
-        B, L, N = x.shape
-        x_ = x.permute(0, 2, 1)                      # [B, N, L]
-        pad_l = window // 2
-        pad_r = window - 1 - pad_l
-        x_pad = F.pad(x_, (pad_l, pad_r), mode='replicate')
-        trend = F.avg_pool1d(x_pad, kernel_size=window, stride=1)  # [B, N, L]
-        return trend.permute(0, 2, 1)                 # [B, L, N]
-
-    def _trend_strength(self, x: Tensor) -> Tensor:
-        # FT = 1 - Var(residual) / Var(detrended_input), clipped to [0, 1]
-        window = max(3, min(self.period, x.shape[1] // 2 if x.shape[1] > 4 else 3))
-        trend = self._moving_average(x, window)
-        resid = x - trend
-        var_resid = resid.var(dim=1, unbiased=False)                  # [B, N]
-        var_detrended = (resid + trend - trend.mean(dim=1, keepdim=True)).var(dim=1, unbiased=False)
-        ft = 1.0 - var_resid / (var_detrended + self.eps)
-        ft = ft.clamp(0.0, 1.0).mean(dim=-1)                           # [B]
-        return ft
-
-    def _seasonality_strength(self, x: Tensor) -> Tensor:
-        # FS via dominant-frequency power ratio of the FFT spectrum
-        B, L, N = x.shape
-        x_centered = x - x.mean(dim=1, keepdim=True)
-        spec = torch.fft.rfft(x_centered, dim=1)
-        power = (spec.real ** 2 + spec.imag ** 2)                      # [B, F, N]
-        # ignore DC component
-        power = power[:, 1:, :] if power.shape[1] > 1 else power
-        total_power = power.sum(dim=1) + self.eps                      # [B, N]
-        dominant_power = power.max(dim=1).values                       # [B, N]
-        fs = (dominant_power / total_power).clamp(0.0, 1.0).mean(dim=-1)  # [B]
-        return fs
-
-    def _distribution_shift(self, x: Tensor) -> Tensor:
-        # compares first-half vs second-half mean/std (normalized distance)
-        L = x.shape[1]
-        half = max(1, L // 2)
-        first, second = x[:, :half, :], x[:, half:, :]
-        mean_diff = (first.mean(dim=1) - second.mean(dim=1)).abs()
-        std_diff = (first.std(dim=1, unbiased=False) - second.std(dim=1, unbiased=False)).abs()
-        scale = x.std(dim=1, unbiased=False) + self.eps
-        shift = ((mean_diff + std_diff) / scale).mean(dim=-1)          # [B]
-        return torch.tanh(shift)                                        # squashed to [0,1)
-
-    def _multivariate_correlation_index(self, x: Tensor) -> Tensor:
-        # mean absolute off-diagonal Pearson correlation across channels
-        B, L, N = x.shape
-        if N == 1:
-            return torch.zeros(B, device=x.device, dtype=x.dtype)
-        x_centered = x - x.mean(dim=1, keepdim=True)
-        std = x_centered.std(dim=1, unbiased=False) + self.eps         # [B, N]
-        x_norm = x_centered / std.unsqueeze(1)                         # [B, L, N]
-        corr = torch.einsum('bln,blm->bnm', x_norm, x_norm) / L        # [B, N, N]
-        eye = torch.eye(N, device=x.device, dtype=torch.bool)
-        off_diag = corr.masked_select(~eye.unsqueeze(0).expand(B, -1, -1)).view(B, -1)
-        mci = off_diag.abs().mean(dim=-1).clamp(0.0, 1.0)               # [B]
-        return mci
-
-    def forward(self, x: Tensor) -> Tensor:
-        # x: [B, L, N] raw input window (before RevIN normalization)
-        ft = self._trend_strength(x)
-        fs = self._seasonality_strength(x)
-        shift = self._distribution_shift(x)
-        mci = self._multivariate_correlation_index(x)
-        stats = torch.stack([ft, fs, shift, mci], dim=-1)              # [B, 4]
-        return stats
-
-
-# =============================================================================
-# Statistical Router
-# =============================================================================
-class StatisticalRouter(nn.Module):
-    """
-    Consumes the 4-dim statistical descriptor vector and produces lightweight,
-    sample-adaptive routing signals that modulate the PatchMixer's internal
-    feature representations:
-      - feature-wise scaling gate over d_model       (channel-wise gating)
-      - patch-wise attention-style modulation weight (attention modulation)
-      - scalar residual mixing coefficient            (adaptive residual weighting)
-
-    The router is intentionally tiny (a 2-layer MLP) to respect the
-    "lightweight module" constraint.
-    """
-    def __init__(self, stat_dim: int, d_model: int, patch_num: int, hidden_dim: int = 16):
-        super().__init__()
-        self.d_model = d_model
-        self.patch_num = patch_num
-
-        self.encoder = nn.Sequential(
-            nn.Linear(stat_dim, hidden_dim),
-            nn.GELU(),
-        )
-        self.feature_gate = nn.Linear(hidden_dim, d_model)     # channel-wise gating (over d_model)
-        self.patch_gate = nn.Linear(hidden_dim, patch_num)     # attention-style modulation (over patches)
-        self.residual_alpha = nn.Linear(hidden_dim, 1)         # adaptive residual weighting scalar
-
-    def forward(self, stats: Tensor):
-        """
-        stats: [B, stat_dim]
-        returns:
-            feat_gate: [B, 1, d_model]   in (0, 2)  -- centered around 1
-            patch_gate: [B, patch_num, 1] in (0, 2)  -- centered around 1
-            alpha: [B, 1, 1] in (0, 1)    -- residual mixing coefficient
-        """
-        h = self.encoder(stats)                                     # [B, hidden]
-        feat_gate = 2 * torch.sigmoid(self.feature_gate(h))         # [B, d_model], centered at 1
-        patch_gate = 2 * torch.sigmoid(self.patch_gate(h))          # [B, patch_num], centered at 1
-        alpha = torch.sigmoid(self.residual_alpha(h))                # [B, 1]
-
-        feat_gate = feat_gate.unsqueeze(1)                           # [B, 1, d_model]
-        patch_gate = patch_gate.unsqueeze(-1)                        # [B, patch_num, 1]
-        alpha = alpha.unsqueeze(-1)                                  # [B, 1, 1]
-        return feat_gate, patch_gate, alpha
-
-
-# =============================================================================
-# Statistical Embedding + Adaptive Fusion
-# =============================================================================
-class StatisticalEmbedding(nn.Module):
-    """Projects the raw statistical descriptors into a learned embedding."""
-    def __init__(self, stat_dim: int, embed_dim: int):
-        super().__init__()
-        self.proj = nn.Sequential(
-            nn.Linear(stat_dim, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, embed_dim)
-        )
-
-    def forward(self, stats: Tensor) -> Tensor:
-        return self.proj(stats)   # [B, embed_dim]
-
-
-class AdaptiveFusion(nn.Module):
-    """
-    Lightweight fusion of PatchMixer temporal features with the statistical
-    embedding. A learnable gate (computed from both signals) determines how
-    much the statistical pathway contributes to the final forecast, sample
-    by sample.
-    """
-    def __init__(self, forecast_dim: int, stat_embed_dim: int):
-        super().__init__()
-        self.stat_to_forecast = nn.Linear(stat_embed_dim, forecast_dim)
-        self.gate = nn.Sequential(
-            nn.Linear(forecast_dim + stat_embed_dim, forecast_dim),
-            nn.Sigmoid()
-        )
-
-    def forward(self, temporal_feat: Tensor, stat_embed: Tensor) -> Tensor:
-        """
-        temporal_feat: [B*N, forecast_dim]
-        stat_embed:    [B, stat_embed_dim]  -> broadcast across N variables
-        """
-        BN = temporal_feat.shape[0]
-        B = stat_embed.shape[0]
-        n_vars = BN // B
-        stat_embed_exp = stat_embed.repeat_interleave(n_vars, dim=0)   # [B*N, stat_embed_dim]
-
-        stat_proj = self.stat_to_forecast(stat_embed_exp)               # [B*N, forecast_dim]
-        g = self.gate(torch.cat([temporal_feat, stat_embed_exp], dim=-1))  # [B*N, forecast_dim]
-        fused = temporal_feat + g * stat_proj
-        return fused
-
-
-# =============================================================================
-# Original PatchMixer building blocks (kept intact)
-# =============================================================================
 class PatchMixerLayer(nn.Module):
-    def __init__(self, dim, a, kernel_size=8):
+    """
+    Original PatchMixer-style temporal mixing block.
+
+    Input:
+        [B*N, PatchNum, D]
+
+    Output:
+        [B*N, PatchNum, D]
+    """
+
+    def __init__(self, dim, a, kernel_size=8, dropout=0.0):
         super().__init__()
+
         self.Resnet = nn.Sequential(
-            nn.Conv1d(dim, dim, kernel_size=kernel_size, groups=dim, padding='same'),
+            nn.Conv1d(
+                dim,
+                dim,
+                kernel_size=kernel_size,
+                groups=dim,
+                padding='same'
+            ),
             nn.GELU(),
             nn.BatchNorm1d(dim)
         )
+
         self.Conv_1x1 = nn.Sequential(
             nn.Conv1d(dim, a, kernel_size=1),
             nn.GELU(),
             nn.BatchNorm1d(a)
         )
 
-    def forward(self, x):
-        x = x + self.Resnet(x)                  # x: [batch * n_val, patch_num, d_model]
-        x = self.Conv_1x1(x)                     # x: [batch * n_val, a, d_model]
-        return x
-
-
-class Model(nn.Module):
-    def __init__(self, configs):
-        super().__init__()
-        self.model = Backbone(configs)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        x = self.model(x)
-        return x
 
+        # x: [B*N, PatchNum, D]
 
-class Backbone(nn.Module):
-    def __init__(self, configs, revin=True, affine=True, subtract_last=False):
-        super().__init__()
+        x = x + self.Resnet(x)
 
-        self.nvals = configs.enc_in
-        self.lookback = configs.seq_len
-        self.forecasting = configs.pred_len
-        self.patch_size = configs.patch_len
-        self.stride = configs.stride
-        self.kernel_size = configs.mixer_kernel_size
+        x = self.Conv_1x1(x)
 
-        self.PatchMixer_blocks = nn.ModuleList([])
-        self.padding_patch_layer = nn.ReplicationPad1d((0, self.stride))
-        self.patch_num = int((self.lookback - self.patch_size) / self.stride + 1) + 1
-        self.a = self.patch_num
-        self.d_model = configs.d_model
-        self.dropout = configs.dropout
-        self.head_dropout = configs.head_dropout
-        self.depth = configs.e_layers
-        for _ in range(self.depth):
-            self.PatchMixer_blocks.append(PatchMixerLayer(dim=self.patch_num, a=self.a, kernel_size=self.kernel_size))
-        self.W_P = nn.Linear(self.patch_size, self.d_model)
-        self.head0 = nn.Sequential(
-            nn.Flatten(start_dim=-2),
-            nn.Linear(self.patch_num * self.d_model, self.forecasting),
-            nn.Dropout(self.head_dropout)
-        )
-        self.head1 = nn.Sequential(
-            nn.Flatten(start_dim=-2),
-            nn.Linear(self.a * self.d_model, int(self.forecasting * 2)),
-            nn.GELU(),
-            nn.Dropout(self.head_dropout),
-            nn.Linear(int(self.forecasting * 2), self.forecasting),
-            nn.Dropout(self.head_dropout)
-        )
-        self.dropout = nn.Dropout(self.dropout)
-
-        # RevIn
-        self.revin = revin
-        if self.revin:
-            self.revin_layer = RevIN(self.nvals, affine=affine, subtract_last=subtract_last)
-
-        # ---------------------------------------------------------------
-        # Statistical Router / Adaptive Fusion (optional, config-gated)
-        # ---------------------------------------------------------------
-        self.use_stat_router = getattr(configs, 'use_stat_router', True)
-        if self.use_stat_router:
-            stat_period = getattr(configs, 'stat_period', 24)
-            stat_embed_dim = getattr(configs, 'stat_embed_dim', 16)
-            router_hidden = getattr(configs, 'stat_router_hidden', 16)
-
-            self.stat_profiler = StatisticalProfiler(period=stat_period)
-            self.stat_router = StatisticalRouter(
-                stat_dim=4, d_model=self.d_model, patch_num=self.patch_num, hidden_dim=router_hidden
-            )
-            self.stat_embedding = StatisticalEmbedding(stat_dim=4, embed_dim=stat_embed_dim)
-            self.adaptive_fusion = AdaptiveFusion(forecast_dim=self.forecasting, stat_embed_dim=stat_embed_dim)
-
-    def forward(self, x):
-        bs = x.shape[0]
-        nvars = x.shape[-1]
-
-        # ---- Statistical Profiling Module (uses raw, pre-RevIN window) ----
-        stats = None
-        if self.use_stat_router:
-            stats = self.stat_profiler(x)                                   # [B, 4]
-
-        if self.revin:
-            x = self.revin_layer(x, 'norm')
-        x = x.permute(0, 2, 1)                                               # x: [batch, n_val, seq_len]
-
-        x_lookback = self.padding_patch_layer(x)
-        x = x_lookback.unfold(dimension=-1, size=self.patch_size, step=self.stride)  # x: [batch, n_val, patch_num, patch_size]
-
-        x = self.W_P(x)                                                      # x: [batch, n_val, patch_num, d_model]
-        x = torch.reshape(x, (x.shape[0] * x.shape[1], x.shape[2], x.shape[3]))  # x: [batch * n_val, patch_num, d_model]
         x = self.dropout(x)
 
-        # ---- Statistical Router: modulate features before the backbone ----
-        if self.use_stat_router:
-            feat_gate, patch_gate, alpha = self.stat_router(stats)          # broadcast per-variable below
-            feat_gate = feat_gate.repeat_interleave(nvars, dim=0)           # [B*N, 1, d_model]
-            patch_gate = patch_gate.repeat_interleave(nvars, dim=0)         # [B*N, patch_num, 1]
-            alpha = alpha.repeat_interleave(nvars, dim=0)                   # [B*N, 1, 1]
-
-            x_gated = x * feat_gate * patch_gate
-            # adaptive residual weighting: blend original vs. gated representation
-            x = alpha * x_gated + (1 - alpha) * x
-
-        u = self.head0(x)
-
-        for PatchMixer_block in self.PatchMixer_blocks:
-            x = PatchMixer_block(x)
-        x = self.head1(x)
-        x = u + x                                                           # x: [batch * n_val, forecasting]
-
-        # ---- Adaptive Fusion: merge temporal features with statistical embedding ----
-        if self.use_stat_router:
-            stat_embed = self.stat_embedding(stats)                         # [B, stat_embed_dim]
-            x = self.adaptive_fusion(x, stat_embed)                         # [batch * n_val, forecasting]
-
-        x = torch.reshape(x, (bs, nvars, -1))                                # x: [batch, n_val, pred_len]
-        x = x.permute(0, 2, 1)
-        if self.revin:
-            x = self.revin_layer(x, 'denorm')
         return x
+
+
+# ============================================================
+# 2. Multi-Scale PatchMixer Branch
+# ============================================================
+
+class MultiScalePatchMixer(nn.Module):
+    """
+    Multi-scale PatchMixer.
+
+    Uses multiple patch sizes:
+        P8
+        P16
+        P32
+
+    Each scale has its own patch embedding and PatchMixer blocks.
+    """
+
+    def __init__(
+        self,
+        seq_len,
+        pred_len,
+        d_model,
+        depth,
+        dropout,
+        head_dropout,
+        kernel_size,
+        patch_sizes=(8, 16, 32),
+        strides=(4, 8, 16)
+    ):
+        super().__init__()
+
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        self.d_model = d_model
+
+        self.patch_sizes = patch_sizes
+        self.strides = strides
+
+        self.branches = nn.ModuleList()
+
+        for patch_size, stride in zip(
+            patch_sizes,
+            strides
+        ):
+
+            # Same padding strategy as original PatchMixer
+            patch_num = (
+                int((seq_len - patch_size) / stride + 1)
+                + 1
+            )
+
+            a = patch_num
+
+            branch = nn.ModuleDict({
+
+                "padding":
+                    nn.ReplicationPad1d((0, stride)),
+
+                "embedding":
+                    nn.Linear(
+                        patch_size,
+                        d_model
+                    ),
+
+                "blocks":
+                    nn.ModuleList([
+                        PatchMixerLayer(
+                            dim=patch_num,
+                            a=a,
+                            kernel_size=kernel_size,
+                            dropout=dropout
+                        )
+                        for _ in range(depth)
+                    ]),
+
+                "head":
+                    nn.Sequential(
+                        nn.Flatten(start_dim=-2),
+
+                        nn.Linear(
+                            a * d_model,
+                            pred_len * 2
+                        ),
+
+                        nn.GELU(),
+
+                        nn.Dropout(head_dropout),
+
+                        nn.Linear(
+                            pred_len * 2,
+                            pred_len
+                        ),
+
+                        nn.Dropout(head_dropout)
+                    )
+            })
+
+            self.branches.append(branch)
+
+        # Fusion of P8/P16/P32
+        self.fusion = nn.Sequential(
+            nn.Linear(
+                len(patch_sizes) * pred_len,
+                pred_len
+            ),
+            nn.GELU(),
+            nn.Dropout(head_dropout)
+        )
+
+    def forward(self, x):
+        """
+        x:
+            [B, N, L]
+
+        returns:
+            [B, N, H]
+        """
+
+        outputs = []
+
+        for branch in self.branches:
+
+            # [B, N, L]
+            z = branch["padding"](x)
+
+            # [B, N, PatchNum, PatchSize]
+            z = z.unfold(
+                dimension=-1,
+                size=branch["embedding"].in_features,
+                step=self.strides[
+                    len(outputs)
+                ]
+            )
+
+            # [B, N, PatchNum, D]
+            z = branch["embedding"](z)
+
+            B, N, P, D = z.shape
+
+            # Channel independent processing
+            z = z.reshape(
+                B * N,
+                P,
+                D
+            )
+
+            for block in branch["blocks"]:
+                z = block(z)
+
+            # [B*N, H]
+            z = branch["head"](z)
+
+            # [B, N, H]
+            z = z.reshape(
+                B,
+                N,
+                self.pred_len
+            )
+
+            outputs.append(z)
+
+        # [B, N, H]
+        fused = torch.cat(
+            outputs,
+            dim=-1
+        )
+
+        fused = self.fusion(fused)
+
+        return fused
+
+
+# ============================================================
+# 3. Trend Extraction
+# ============================================================
+
+class MovingAverage(nn.Module):
+
+    def __init__(self, kernel_size):
+        super().__init__()
+
+        self.kernel_size = kernel_size
+
+    def forward(self, x):
+        """
+        x:
+            [B, L, N]
+        """
+
+        k = self.kernel_size
+
+        # Make sure kernel is odd
+        if k % 2 == 0:
+            k += 1
+
+        # [B, N, L]
+        x = x.permute(0, 2, 1)
+
+        # Replication padding
+        pad = k // 2
+
+        x = F.pad(
+            x,
+            (pad, pad),
+            mode='replicate'
+        )
+
+        # Moving average
+        trend = F.avg_pool1d(
+            x,
+            kernel_size=k,
+            stride=1
+        )
+
+        # [B, L, N]
+        trend = trend.permute(
+            0, 2, 1
+        )
+
+        return trend
+
+
+class SeriesDecomposition(nn.Module):
+
+    def __init__(self, kernel_size):
+        super().__init__()
+
+        self.moving_avg = MovingAverage(
+            kernel_size
+        )
+
+    def forward(self, x):
+
+        trend = self.moving_avg(x)
+
+        residual = x - trend
+
+        return trend, residual
+
+
+# ============================================================
+# 4. Linear Trend Branch
+# ============================================================
+
+class LinearTrendBranch(nn.Module):
+    """
+    Linear forecasting branch.
+
+    Similar motivation to NLinear/DLinear:
+    explicitly model the long-term trend.
+    """
+
+    def __init__(
+        self,
+        seq_len,
+        pred_len,
+        nvars,
+        dropout=0.0
+    ):
+        super().__init__()
+
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+
+        # Shared temporal projection
+        self.linear = nn.Linear(
+            seq_len,
+            pred_len
+        )
+
+        self.dropout = nn.Dropout(
+            dropout
+        )
+
+    def forward(self, trend):
+
+        # trend:
+        # [B, L, N]
+
+        x = trend.permute(
+            0, 2, 1
+        )
+
+        # [B, N, H]
+        x = self.linear(x)
+
+        x = self.dropout(x)
+
+        return x
+
+
+# ============================================================
+# 5. Adaptive Channel Gate
+# ============================================================
+
+class AdaptiveChannelGate(nn.Module):
+    """
+    Learnable channel mixing gate.
+
+    Important:
+    PatchMixer remains channel-independent by default.
+
+    This module only introduces a gated residual
+    channel interaction.
+    """
+
+    def __init__(
+        self,
+        nvars,
+        pred_len,
+        hidden_dim=64,
+        dropout=0.0
+    ):
+        super().__init__()
+
+        self.nvars = nvars
+        self.pred_len = pred_len
+
+        # Channel interaction
+        self.channel_mixer = nn.Sequential(
+
+            nn.Conv1d(
+                nvars,
+                nvars,
+                kernel_size=1
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(dropout),
+
+            nn.Conv1d(
+                nvars,
+                nvars,
+                kernel_size=1
+            )
+        )
+
+        # Learnable gate
+        self.gate = nn.Sequential(
+
+            nn.Linear(
+                nvars,
+                hidden_dim
+            ),
+
+            nn.GELU(),
+
+            nn.Linear(
+                hidden_dim,
+                nvars
+            ),
+
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        """
+        x:
+            [B, N, H]
+        """
+
+        # Channel statistics
+        context = x.mean(
+            dim=-1
+        )
+
+        # [B, N]
+        gate = self.gate(context)
+
+        # [B, N, 1]
+        gate = gate.unsqueeze(-1)
+
+        # Channel mixing
+        mixed = self.channel_mixer(x)
+
+        # Adaptive residual mixing
+        out = x + gate * mixed
+
+        return out
+
+
+# ============================================================
+# 6. Adaptive Fusion
+# ============================================================
+
+class AdaptiveFusion(nn.Module):
+    """
+    Learns the contribution of:
+        PatchMixer
+        Linear Trend
+    """
+
+    def __init__(
+        self,
+        pred_len,
+        hidden_dim=64
+    ):
+        super().__init__()
+
+        self.gate = nn.Sequential(
+
+            nn.Linear(
+                pred_len * 2,
+                hidden_dim
+            ),
+
+            nn.GELU(),
+
+            nn.Linear(
+                hidden_dim,
+                pred_len
+            ),
+
+            nn.Sigmoid()
+        )
+
+    def forward(
+        self,
+        patch_forecast,
+        trend_forecast
+    ):
+        """
+        Both:
+            [B, N, H]
+        """
+
+        combined = torch.cat(
+            [
+                patch_forecast,
+                trend_forecast
+            ],
+            dim=-1
+        )
+
+        # Horizon-specific gate
+        alpha = self.gate(
+            combined
+        )
+
+        # Horizon-aware fusion
+        output = (
+            alpha * patch_forecast
+            +
+            (1.0 - alpha)
+            * trend_forecast
+        )
+
+        return output, alpha
+
+
+# ============================================================
+# 7. Main Backbone
+# ============================================================
+
+class Backbone(nn.Module):
+
+    def __init__(
+        self,
+        configs,
+        revin=True,
+        affine=True,
+        subtract_last=False
+    ):
+        super().__init__()
+
+        self.nvars = configs.enc_in
+        self.lookback = configs.seq_len
+        self.forecasting = configs.pred_len
+
+        self.d_model = getattr(
+            configs,
+            "d_model",
+            128
+        )
+
+        self.depth = getattr(
+            configs,
+            "e_layers",
+            2
+        )
+
+        self.dropout_rate = getattr(
+            configs,
+            "dropout",
+            0.1
+        )
+
+        self.head_dropout = getattr(
+            configs,
+            "head_dropout",
+            0.0
+        )
+
+        self.kernel_size = getattr(
+            configs,
+            "mixer_kernel_size",
+            8
+        )
+
+        # ----------------------------------------------------
+        # Multi-scale settings
+        # ----------------------------------------------------
+
+        self.patch_sizes = getattr(
+            configs,
+            "patch_sizes",
+            [8, 16, 32]
+        )
+
+        self.strides = getattr(
+            configs,
+            "patch_strides",
+            [4, 8, 16]
+        )
+
+        # ----------------------------------------------------
+        # Decomposition
+        # ----------------------------------------------------
+
+        self.trend_kernel = getattr(
+            configs,
+            "trend_kernel",
+            25
+        )
+
+        self.decomposition = (
+            SeriesDecomposition(
+                self.trend_kernel
+            )
+        )
+
+        # ----------------------------------------------------
+        # Multi-scale PatchMixer
+        # ----------------------------------------------------
+
+        self.patch_mixer = MultiScalePatchMixer(
+
+            seq_len=self.lookback,
+
+            pred_len=self.forecasting,
+
+            d_model=self.d_model,
+
+            depth=self.depth,
+
+            dropout=self.dropout_rate,
+
+            head_dropout=self.head_dropout,
+
+            kernel_size=self.kernel_size,
+
+            patch_sizes=self.patch_sizes,
+
+            strides=self.strides
+        )
+
+        # ----------------------------------------------------
+        # Trend branch
+        # ----------------------------------------------------
+
+        self.trend_branch = LinearTrendBranch(
+
+            seq_len=self.lookback,
+
+            pred_len=self.forecasting,
+
+            nvars=self.nvars,
+
+            dropout=self.dropout_rate
+        )
+
+        # ----------------------------------------------------
+        # Adaptive fusion
+        # ----------------------------------------------------
+
+        self.adaptive_fusion = AdaptiveFusion(
+
+            pred_len=self.forecasting,
+
+            hidden_dim=getattr(
+                configs,
+                "fusion_hidden",
+                64
+            )
+        )
+
+        # ----------------------------------------------------
+        # Adaptive channel mixing
+        # ----------------------------------------------------
+
+        self.channel_gate = AdaptiveChannelGate(
+
+            nvars=self.nvars,
+
+            pred_len=self.forecasting,
+
+            hidden_dim=getattr(
+                configs,
+                "channel_hidden",
+                64
+            ),
+
+            dropout=self.dropout_rate
+        )
+
+        # ----------------------------------------------------
+        # Final projection
+        # ----------------------------------------------------
+
+        self.output_projection = nn.Sequential(
+
+            nn.Linear(
+                self.forecasting,
+                self.forecasting
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(
+                self.head_dropout
+            )
+        )
+
+        # ----------------------------------------------------
+        # RevIN
+        # ----------------------------------------------------
+
+        self.revin = revin
+
+        if self.revin:
+
+            self.revin_layer = RevIN(
+                self.nvars,
+                affine=affine,
+                subtract_last=subtract_last
+            )
+
+    def forward(
+        self,
+        x,
+        return_gate=False
+    ):
+        """
+        Input:
+            x [B, L, N]
+
+        Output:
+            [B, H, N]
+        """
+
+        # ----------------------------------------------------
+        # RevIN normalization
+        # ----------------------------------------------------
+
+        if self.revin:
+            x = self.revin_layer(
+                x,
+                'norm'
+            )
+
+        # ----------------------------------------------------
+        # Decomposition
+        # ----------------------------------------------------
+
+        trend, residual = self.decomposition(x)
+
+        # ----------------------------------------------------
+        # PatchMixer operates on residual
+        # ----------------------------------------------------
+
+        residual = residual.permute(
+            0, 2, 1
+        )
+
+        patch_forecast = self.patch_mixer(
+            residual
+        )
+
+        # ----------------------------------------------------
+        # Trend branch
+        # ----------------------------------------------------
+
+        trend_forecast = self.trend_branch(
+            trend
+        )
+
+        # ----------------------------------------------------
+        # Adaptive fusion
+        # ----------------------------------------------------
+
+        fused, alpha = self.adaptive_fusion(
+
+            patch_forecast,
+
+            trend_forecast
+        )
+
+        # ----------------------------------------------------
+        # Adaptive channel mixing
+        # ----------------------------------------------------
+
+        fused = self.channel_gate(
+            fused
+        )
+
+        # ----------------------------------------------------
+        # Final projection
+        # ----------------------------------------------------
+
+        fused = self.output_projection(
+            fused
+        )
+
+        # ----------------------------------------------------
+        # [B, N, H] -> [B, H, N]
+        # ----------------------------------------------------
+
+        output = fused.permute(
+            0, 2, 1
+        )
+
+        # ----------------------------------------------------
+        # RevIN denormalization
+        # ----------------------------------------------------
+
+        if self.revin:
+
+            output = self.revin_layer(
+                output,
+                'denorm'
+            )
+
+        if return_gate:
+            return output, alpha
+
+        return output
+
+
+# ============================================================
+# 8. Model Wrapper
+# ============================================================
+
+class Model(nn.Module):
+
+    def __init__(self, configs):
+
+        super().__init__()
+
+        self.model = Backbone(
+            configs
+        )
+
+    def forward(
+        self,
+        x_enc,
+        x_mark_enc=None,
+        x_dec=None,
+        x_mark_dec=None,
+        mask=None
+    ):
+
+        return self.model(
+            x_enc
+        )
