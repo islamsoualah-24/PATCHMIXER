@@ -142,7 +142,7 @@ class Model(nn.Module):
         g = lambda k, d: getattr(configs, k, d)
         self.T = g('diff_steps', 50)
         self.ddim_steps = min(g('ddim_steps', 10), self.T)
-        self.n_samples = g('n_samples', 1)
+        self.n_samples = g('n_samples', 20)
         self.diff_weight = g('diff_weight', 1.0)
         self.sample_in_train = g('sample_in_train', False)
         self.res_clip = g('res_clip', 5.0)
