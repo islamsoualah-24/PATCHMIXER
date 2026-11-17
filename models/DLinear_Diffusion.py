@@ -236,71 +236,71 @@ class Model(nn.Module):
 
     # ------------------------------------------------------------------ sampling
     
-@torch.no_grad()
-def _sample_residual(self, cond, chan_idx, n_samples):
-    """Deterministic DDIM sampling."""
-
-    N = cond.size(0)
-
-    # Encode condition: [N, d]
-    cond_emb = self.denoiser.encode_condition(cond, chan_idx)
-
-    # Repeat each condition for its own samples
-    cond_emb = cond_emb.repeat_interleave(n_samples, dim=0)
-
-    # Initial noise: [n_samples * N, pred_len]
-    r = torch.randn(
-        n_samples * N,
-        self.pred_len,
-        device=cond.device
-    )
-
-    steps = torch.linspace(
-        self.T - 1, 0, self.ddim_steps,
-        device=cond.device
-    ).long()
-
-    for i, t in enumerate(steps):
-
-        ab_t = self.alpha_bar[t]
-
-        if i + 1 < len(steps):
-            ab_prev = self.alpha_bar[steps[i + 1]]
-        else:
-            ab_prev = cond.new_tensor(1.0)
-
-        tt = torch.full(
-            (r.size(0),),
-            int(t),
-            device=cond.device,
-            dtype=torch.long
+    @torch.no_grad()
+    def _sample_residual(self, cond, chan_idx, n_samples):
+        """Deterministic DDIM sampling."""
+    
+        N = cond.size(0)
+    
+        # Encode condition: [N, d]
+        cond_emb = self.denoiser.encode_condition(cond, chan_idx)
+    
+        # Repeat each condition for its own samples
+        cond_emb = cond_emb.repeat_interleave(n_samples, dim=0)
+    
+        # Initial noise: [n_samples * N, pred_len]
+        r = torch.randn(
+            n_samples * N,
+            self.pred_len,
+            device=cond.device
         )
-
-        # Check dimensions
-        assert cond_emb.shape == (r.size(0), self.d), (
-            f"Condition shape error: {cond_emb.shape}, "
-            f"expected {(r.size(0), self.d)}"
-        )
-
-        eps = self.denoiser(r, tt, cond_emb)
-
-        r0 = (
-            (r - (1 - ab_t).sqrt() * eps) /
-            ab_t.sqrt()
-        ).clamp(-self.res_clip, self.res_clip)
-
-        eps = (
-            (r - ab_t.sqrt() * r0) /
-            (1 - ab_t).sqrt().clamp_min(1e-8)
-        )
-
-        r = (
-            ab_prev.sqrt() * r0 +
-            (1 - ab_prev).sqrt() * eps
-        )
-
-    return r.view(n_samples, N, self.pred_len)
-
+    
+        steps = torch.linspace(
+            self.T - 1, 0, self.ddim_steps,
+            device=cond.device
+        ).long()
+    
+        for i, t in enumerate(steps):
+    
+            ab_t = self.alpha_bar[t]
+    
+            if i + 1 < len(steps):
+                ab_prev = self.alpha_bar[steps[i + 1]]
+            else:
+                ab_prev = cond.new_tensor(1.0)
+    
+            tt = torch.full(
+                (r.size(0),),
+                int(t),
+                device=cond.device,
+                dtype=torch.long
+            )
+    
+            # Check dimensions
+            assert cond_emb.shape == (r.size(0), self.d), (
+                f"Condition shape error: {cond_emb.shape}, "
+                f"expected {(r.size(0), self.d)}"
+            )
+    
+            eps = self.denoiser(r, tt, cond_emb)
+    
+            r0 = (
+                (r - (1 - ab_t).sqrt() * eps) /
+                ab_t.sqrt()
+            ).clamp(-self.res_clip, self.res_clip)
+    
+            eps = (
+                (r - ab_t.sqrt() * r0) /
+                (1 - ab_t).sqrt().clamp_min(1e-8)
+            )
+    
+            r = (
+                ab_prev.sqrt() * r0 +
+                (1 - ab_prev).sqrt() * eps
+            )
+    
+        return r.view(n_samples, N, self.pred_len)
+    
     @torch.no_grad()
     def sample(self, x, n_samples=None):
         """Probabilistic forecasts: [S, B, pred_len, C] (DLinear + sampled residuals)."""
