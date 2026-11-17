@@ -4,26 +4,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ----------------------------------------------------------------------------
-# Original DLinear building blocks (unchanged)
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Original DLinear building blocks
+# -----------------------------------------------------------------------------
 class moving_avg(nn.Module):
-    """Moving average block to highlight the trend of time series"""
+    """Moving average block to highlight the trend of time series."""
+
     def __init__(self, kernel_size, stride):
         super(moving_avg, self).__init__()
         self.kernel_size = kernel_size
-        self.avg = nn.AvgPool1d(kernel_size=kernel_size, stride=stride, padding=0)
+        self.avg = nn.AvgPool1d(
+            kernel_size=kernel_size, stride=stride, padding=0
+        )
 
     def forward(self, x):
-        front = x[:, 0:1, :].repeat(1, (self.kernel_size - 1) // 2, 1)
-        end = x[:, -1:, :].repeat(1, (self.kernel_size - 1) // 2, 1)
+        front = x[:, 0:1, :].repeat(
+            1, (self.kernel_size - 1) // 2, 1
+        )
+        end = x[:, -1:, :].repeat(
+            1, (self.kernel_size - 1) // 2, 1
+        )
         x = torch.cat([front, x, end], dim=1)
         x = self.avg(x.permute(0, 2, 1))
         return x.permute(0, 2, 1)
 
 
 class series_decomp(nn.Module):
-    """Series decomposition block"""
+    """Series decomposition block."""
+
     def __init__(self, kernel_size):
         super(series_decomp, self).__init__()
         self.moving_avg = moving_avg(kernel_size, stride=1)
@@ -34,24 +42,36 @@ class series_decomp(nn.Module):
         return res, moving_mean
 
 
-# ----------------------------------------------------------------------------
-# Lightweight conditional denoiser
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Diffusion timestep embedding
+# -----------------------------------------------------------------------------
 def timestep_embedding(t, dim):
-    """Sinusoidal embedding of integer diffusion steps. t: [N] -> [N, dim]"""
+    """Sinusoidal embedding: t [N] -> [N, dim]."""
     half = dim // 2
-    freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=t.device) / half)
-    args = t.float()[:, None] * freqs[None]
-    return torch.cat([args.sin(), args.cos()], dim=-1)
+    freqs = torch.exp(
+        -math.log(10000.0)
+        * torch.arange(half, device=t.device, dtype=torch.float32)
+        / max(half, 1)
+    )
+    args = t.float()[:, None] * freqs[None, :]
+    emb = torch.cat([args.sin(), args.cos()], dim=-1)
+    if dim % 2 == 1:
+        emb = F.pad(emb, (0, 1))
+    return emb
 
 
 class FiLMBlock(nn.Module):
-    """Residual MLP block modulated (FiLM) by timestep + history condition."""
+    """Residual MLP block modulated by timestep and history condition."""
+
     def __init__(self, d):
         super().__init__()
         self.norm = nn.LayerNorm(d, elementwise_affine=False)
         self.film = nn.Linear(d, 2 * d)
-        self.mlp = nn.Sequential(nn.Linear(d, 2 * d), nn.GELU(), nn.Linear(2 * d, d))
+        self.mlp = nn.Sequential(
+            nn.Linear(d, 2 * d),
+            nn.GELU(),
+            nn.Linear(2 * d, d)
+        )
 
     def forward(self, h, c):
         scale, shift = self.film(c).chunk(2, dim=-1)
@@ -60,69 +80,73 @@ class FiLMBlock(nn.Module):
 
 class ResidualDenoiser(nn.Module):
     """
-    eps_theta(r_t, t | history, base forecast)
-    Works on flattened series [N = B*C, pred_len] and is shared across channels,
-    so its size does not grow with the number of variables.
+    Predict epsilon_theta(r_t, t | history, base forecast).
+    Input/output vectors have shape [N=B*C, pred_len].
+    The denoiser is shared across channels.
     """
+
     def __init__(self, seq_len, pred_len, channels, d=128, layers=2):
         super().__init__()
         self.d = d
         self.in_proj = nn.Linear(pred_len, d)
         self.cond_enc = nn.Sequential(
-            nn.Linear(seq_len + pred_len, d), nn.GELU(), nn.Linear(d, d))
+            nn.Linear(seq_len + pred_len, d),
+            nn.GELU(),
+            nn.Linear(d, d)
+        )
         self.chan_emb = nn.Embedding(channels, d)
-        self.t_mlp = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d))
-        self.blocks = nn.ModuleList([FiLMBlock(d) for _ in range(layers)])
+        self.t_mlp = nn.Sequential(
+            nn.Linear(d, d),
+            nn.GELU(),
+            nn.Linear(d, d)
+        )
+        self.blocks = nn.ModuleList(
+            [FiLMBlock(d) for _ in range(layers)]
+        )
         self.out_norm = nn.LayerNorm(d)
         self.out_proj = nn.Linear(d, pred_len)
-        nn.init.zeros_(self.out_proj.weight)  # start by predicting zero noise
+
+        # Start by predicting zero noise.
+        nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
     def encode_condition(self, cond, chan_idx):
-        """History-derived condition embedding (computed once per sampling)."""
         return self.cond_enc(cond) + self.chan_emb(chan_idx)
 
     def forward(self, r_t, t, cond_emb):
         c = cond_emb + self.t_mlp(timestep_embedding(t, self.d))
         h = self.in_proj(r_t)
-        for blk in self.blocks:
-            h = blk(h, c)
+        for block in self.blocks:
+            h = block(h, c)
         return self.out_proj(self.out_norm(h))
 
 
-# ----------------------------------------------------------------------------
-# DLinear + conditional diffusion on the residual
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# DLinear + conditional diffusion
+# -----------------------------------------------------------------------------
 class Model(nn.Module):
     """
-    DLinear-Diffusion
+    DLinear-Diffusion.
 
-      y_hat = Linear_Trend(trend) + Linear_Seasonal(seasonal)   (original DLinear)
-              + residual ~ p(r | history, y_dlinear)            (diffusion)
+    Forecast = DLinear forecast + diffusion-generated residual.
 
-    where r = y_true - y_dlinear is the high-frequency part the linear model
-    cannot explain. The diffusion model is conditioned on the history
-    (its seasonal/high-frequency part) and on the DLinear forecast.
+    Input:
+        x: [B, seq_len, C]
 
-    I/O is identical to DLinear: forward(x[B, L, C]) -> [B, pred_len, C].
+    Standard output:
+        [B, pred_len, C]
 
-    Behaviour of forward():
-      * training mode : returns the DLinear forecast only (cheap, so the
-                        unchanged `MSE(model(x), y)` loop still works).
-                        Set configs.sample_in_train=True to sample here too.
-      * eval mode     : returns DLinear forecast + diffusion-sampled residual.
-    For joint training use `compute_loss(x, y)` (see __main__ example).
-
-    Optional configs (defaults in brackets):
-      diff_steps[50] diff_hidden[128] diff_layers[2] ddim_steps[10]
-      n_samples[1] diff_weight[1.0] sample_in_train[False] res_clip[5.0]
+    Joint training:
+        model(x, target=y, return_loss=True, loss_flag=...)
     """
+
     def __init__(self, configs):
         super(Model, self).__init__()
+
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
 
-        # ---- original DLinear ------------------------------------------------
+        # Original DLinear
         kernel_size = 25
         self.decompsition = series_decomp(kernel_size)
         self.individual = configs.individual
@@ -132,14 +156,23 @@ class Model(nn.Module):
             self.Linear_Seasonal = nn.ModuleList()
             self.Linear_Trend = nn.ModuleList()
             for _ in range(self.channels):
-                self.Linear_Seasonal.append(nn.Linear(self.seq_len, self.pred_len))
-                self.Linear_Trend.append(nn.Linear(self.seq_len, self.pred_len))
+                self.Linear_Seasonal.append(
+                    nn.Linear(self.seq_len, self.pred_len)
+                )
+                self.Linear_Trend.append(
+                    nn.Linear(self.seq_len, self.pred_len)
+                )
         else:
-            self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
-            self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
+            self.Linear_Seasonal = nn.Linear(
+                self.seq_len, self.pred_len
+            )
+            self.Linear_Trend = nn.Linear(
+                self.seq_len, self.pred_len
+            )
 
-        # ---- diffusion head --------------------------------------------------
-        g = lambda k, d: getattr(configs, k, d)
+        # Diffusion configuration
+        g = lambda key, default: getattr(configs, key, default)
+
         self.T = g('diff_steps', 50)
         self.ddim_steps = min(g('ddim_steps', 10), self.T)
         self.n_samples = g('n_samples', 20)
@@ -147,184 +180,282 @@ class Model(nn.Module):
         self.sample_in_train = g('sample_in_train', False)
         self.res_clip = g('res_clip', 5.0)
 
+        # Fix: define self.d on Model; sampling uses this attribute.
+        self.d = g('diff_hidden', 128)
+
         self.denoiser = ResidualDenoiser(
-            self.seq_len, self.pred_len, self.channels,
-            d=g('diff_hidden', 128), layers=g('diff_layers', 2))
+            self.seq_len,
+            self.pred_len,
+            self.channels,
+            d=self.d,
+            layers=g('diff_layers', 2)
+        )
 
         betas = torch.linspace(1e-4, 2e-2, self.T)
-        self.register_buffer('alpha_bar', torch.cumprod(1.0 - betas, dim=0))
-        # EMA of the std of the (history-normalised) residual -> unit-variance target
+        self.register_buffer(
+            'alpha_bar',
+            torch.cumprod(1.0 - betas, dim=0)
+        )
         self.register_buffer('res_std', torch.ones(1))
 
-    # ------------------------------------------------------------------ DLinear
+    # -------------------------------------------------------------------------
+    # DLinear forecast
+    # -------------------------------------------------------------------------
     def _dlinear(self, x):
-        """Original DLinear. Returns forecast [B, H, C] and seasonal history [B, C, L]."""
         seasonal_init, trend_init = self.decompsition(x)
-        seasonal_init, trend_init = seasonal_init.permute(0, 2, 1), trend_init.permute(0, 2, 1)
+        seasonal_init = seasonal_init.permute(0, 2, 1)
+        trend_init = trend_init.permute(0, 2, 1)
+
         if self.individual:
-            seasonal_output = torch.zeros([seasonal_init.size(0), seasonal_init.size(1), self.pred_len],
-                                          dtype=seasonal_init.dtype).to(seasonal_init.device)
-            trend_output = torch.zeros([trend_init.size(0), trend_init.size(1), self.pred_len],
-                                       dtype=trend_init.dtype).to(trend_init.device)
+            seasonal_output = torch.zeros(
+                seasonal_init.size(0),
+                seasonal_init.size(1),
+                self.pred_len,
+                dtype=seasonal_init.dtype,
+                device=seasonal_init.device
+            )
+            trend_output = torch.zeros(
+                trend_init.size(0),
+                trend_init.size(1),
+                self.pred_len,
+                dtype=trend_init.dtype,
+                device=trend_init.device
+            )
             for i in range(self.channels):
-                seasonal_output[:, i, :] = self.Linear_Seasonal[i](seasonal_init[:, i, :])
-                trend_output[:, i, :] = self.Linear_Trend[i](trend_init[:, i, :])
+                seasonal_output[:, i, :] = self.Linear_Seasonal[i](
+                    seasonal_init[:, i, :]
+                )
+                trend_output[:, i, :] = self.Linear_Trend[i](
+                    trend_init[:, i, :]
+                )
         else:
             seasonal_output = self.Linear_Seasonal(seasonal_init)
             trend_output = self.Linear_Trend(trend_init)
-        base = (seasonal_output + trend_output).permute(0, 2, 1)  # [B, H, C]
+
+        base = (seasonal_output + trend_output).permute(0, 2, 1)
         return base, seasonal_init
 
-    # ---------------------------------------------------------------- condition
+    # -------------------------------------------------------------------------
+    # Build conditioning information
+    # -------------------------------------------------------------------------
     def _condition(self, x, base, seasonal_hist):
-        """
-        Flatten to per-series vectors and build the (scale-free) condition.
-        Returns cond [N, L+H], scale [N, 1], chan_idx [N]   with N = B*C.
-        """
-        B, L, C = x.shape
-        xf = x.permute(0, 2, 1).reshape(B * C, L)
+        batch_size, seq_len, channels = x.shape
+
+        xf = x.permute(0, 2, 1).reshape(
+            batch_size * channels, seq_len
+        )
         mu = xf.mean(-1, keepdim=True)
-        s = xf.std(-1, keepdim=True).detach() + 1e-5
-        hist = seasonal_hist.reshape(B * C, L) / s
-        bf = (base.detach().permute(0, 2, 1).reshape(B * C, self.pred_len) - mu) / s
-        cond = torch.cat([hist, bf], dim=-1)
-        chan_idx = torch.arange(C, device=x.device).repeat(B)
-        return cond, s, chan_idx
+        scale = xf.std(-1, keepdim=True).detach() + 1e-5
 
-    # ------------------------------------------------------------------ training
+        hist = seasonal_hist.reshape(
+            batch_size * channels, seq_len
+        ) / scale
+
+        base_flat = base.detach().permute(0, 2, 1).reshape(
+            batch_size * channels, self.pred_len
+        )
+        base_norm = (base_flat - mu) / scale
+        cond = torch.cat([hist, base_norm], dim=-1)
+
+        chan_idx = torch.arange(
+            channels, device=x.device
+        ).repeat(batch_size)
+
+        return cond, scale, chan_idx
+
+    # -------------------------------------------------------------------------
+    # Joint training loss
+    # -------------------------------------------------------------------------
     def compute_loss(self, x, y, loss_flag=0):
-        """
-        Jointly train DLinear and the conditional residual denoiser.
-
-        x: [B, seq_len, C]
-        y: [B, pred_len, C]
-        loss_flag follows Exp_Main:
-          1 = MAE, 2 = 0.5*MAE + 0.5*MSE, 3 = SmoothL1, otherwise MSE.
-        """
         base, seasonal_hist = self._dlinear(x)
 
         if loss_flag == 1:
             loss_base = F.l1_loss(base, y)
         elif loss_flag == 2:
-            loss_base = 0.5 * F.l1_loss(base, y) + 0.5 * F.mse_loss(base, y)
+            loss_base = (
+                0.5 * F.l1_loss(base, y)
+                + 0.5 * F.mse_loss(base, y)
+            )
         elif loss_flag == 3:
             loss_base = F.smooth_l1_loss(base, y)
         else:
-            # loss_flag=4 is an external PatchMixer-specific loss; use MSE
-            # for the DLinear base term rather than applying an incompatible loss.
             loss_base = F.mse_loss(base, y)
 
-        cond, s, chan_idx = self._condition(x, base, seasonal_hist)
-        B, H, C = y.shape
-        r = (y - base).detach().permute(0, 2, 1).reshape(B * C, H) / s  # normalised residual
+        cond, scale, chan_idx = self._condition(
+            x, base, seasonal_hist
+        )
+        batch_size, horizon, channels = y.shape
+
+        residual = (
+            (y - base).detach()
+            .permute(0, 2, 1)
+            .reshape(batch_size * channels, horizon)
+            / scale
+        )
 
         if self.training:
             with torch.no_grad():
-                self.res_std.mul_(0.99).add_(0.01 * r.std().clamp_min(1e-5))
-        r0 = r / self.res_std
+                current_std = residual.std().clamp_min(1e-5)
+                self.res_std.mul_(0.99).add_(0.01 * current_std)
 
-        t = torch.randint(0, self.T, (r0.size(0),), device=x.device)
-        noise = torch.randn_like(r0)
-        ab = self.alpha_bar[t][:, None]
-        r_t = ab.sqrt() * r0 + (1 - ab).sqrt() * noise
+        residual_norm = residual / self.res_std
 
-        eps = self.denoiser(r_t, t, self.denoiser.encode_condition(cond, chan_idx))
-        loss_diff = F.mse_loss(eps, noise)
+        t = torch.randint(
+            0, self.T, (residual_norm.size(0),), device=x.device
+        )
+        noise = torch.randn_like(residual_norm)
+        alpha_bar_t = self.alpha_bar[t][:, None]
 
-        total = loss_base + self.diff_weight * loss_diff
-        return total, {'base': loss_base.detach(), 'diff': loss_diff.detach()}
+        noisy_residual = (
+            alpha_bar_t.sqrt() * residual_norm
+            + (1.0 - alpha_bar_t).sqrt() * noise
+        )
 
-    # ------------------------------------------------------------------ sampling
-    
+        cond_emb = self.denoiser.encode_condition(cond, chan_idx)
+        predicted_noise = self.denoiser(
+            noisy_residual, t, cond_emb
+        )
+        loss_diff = F.mse_loss(predicted_noise, noise)
+
+        total_loss = loss_base + self.diff_weight * loss_diff
+
+        return total_loss, {
+            'base': loss_base.detach(),
+            'diff': loss_diff.detach()
+        }
+
+    # -------------------------------------------------------------------------
+    # DDIM residual sampling
+    # -------------------------------------------------------------------------
     @torch.no_grad()
     def _sample_residual(self, cond, chan_idx, n_samples):
-        """Deterministic DDIM sampling."""
-    
-        N = cond.size(0)
-    
-        # Encode condition: [N, d]
+        """
+        Returns residual samples with shape [S, N, pred_len].
+        """
+        num_series = cond.size(0)
+
         cond_emb = self.denoiser.encode_condition(cond, chan_idx)
-    
-        # Repeat each condition for its own samples
         cond_emb = cond_emb.repeat_interleave(n_samples, dim=0)
-    
-        # Initial noise: [n_samples * N, pred_len]
-        r = torch.randn(
-            n_samples * N,
+
+        residual = torch.randn(
+            num_series * n_samples,
             self.pred_len,
-            device=cond.device
+            device=cond.device,
+            dtype=cond.dtype
         )
-    
+
         steps = torch.linspace(
-            self.T - 1, 0, self.ddim_steps,
+            self.T - 1,
+            0,
+            self.ddim_steps,
             device=cond.device
         ).long()
-    
-        for i, t in enumerate(steps):
-    
-            ab_t = self.alpha_bar[t]
-    
+
+        for i, timestep in enumerate(steps):
+            alpha_bar_t = self.alpha_bar[timestep]
+
             if i + 1 < len(steps):
-                ab_prev = self.alpha_bar[steps[i + 1]]
+                alpha_bar_prev = self.alpha_bar[steps[i + 1]]
             else:
-                ab_prev = cond.new_tensor(1.0)
-    
-            tt = torch.full(
-                (r.size(0),),
-                int(t),
+                alpha_bar_prev = cond.new_tensor(1.0)
+
+            t_batch = torch.full(
+                (residual.size(0),),
+                int(timestep.item()),
                 device=cond.device,
                 dtype=torch.long
             )
-    
-            # Check dimensions
-            assert cond_emb.shape == (r.size(0), self.d), (
-                f"Condition shape error: {cond_emb.shape}, "
-                f"expected {(r.size(0), self.d)}"
+
+            assert cond_emb.shape == (
+                residual.size(0), self.d
+            ), (
+                f"Condition shape error: {cond_emb.shape}; "
+                f"expected {(residual.size(0), self.d)}"
             )
-    
-            eps = self.denoiser(r, tt, cond_emb)
-    
-            r0 = (
-                (r - (1 - ab_t).sqrt() * eps) /
-                ab_t.sqrt()
-            ).clamp(-self.res_clip, self.res_clip)
-    
-            eps = (
-                (r - ab_t.sqrt() * r0) /
-                (1 - ab_t).sqrt().clamp_min(1e-8)
+
+            predicted_noise = self.denoiser(
+                residual, t_batch, cond_emb
             )
-    
-            r = (
-                ab_prev.sqrt() * r0 +
-                (1 - ab_prev).sqrt() * eps
+
+            predicted_residual = (
+                residual
+                - (1.0 - alpha_bar_t).sqrt() * predicted_noise
+            ) / alpha_bar_t.sqrt()
+
+            predicted_residual = predicted_residual.clamp(
+                -self.res_clip, self.res_clip
             )
-    
-        return r.view(n_samples, N, self.pred_len)
-    
+
+            predicted_noise = (
+                residual - alpha_bar_t.sqrt() * predicted_residual
+            ) / (1.0 - alpha_bar_t).sqrt().clamp_min(1e-8)
+
+            residual = (
+                alpha_bar_prev.sqrt() * predicted_residual
+                + (1.0 - alpha_bar_prev).sqrt() * predicted_noise
+            )
+
+        # Correct ordering for repeat_interleave:
+        # [N, S, H] -> [S, N, H].
+        return (
+            residual
+            .view(num_series, n_samples, self.pred_len)
+            .permute(1, 0, 2)
+            .contiguous()
+        )
+
     @torch.no_grad()
     def sample(self, x, n_samples=None):
-        """Probabilistic forecasts: [S, B, pred_len, C] (DLinear + sampled residuals)."""
-        n_samples = n_samples or self.n_samples
-        B, _, C = x.shape
-        base, seasonal_hist = self._dlinear(x)
-        cond, s, chan_idx = self._condition(x, base, seasonal_hist)
-        r = self._sample_residual(cond, chan_idx, n_samples) * self.res_std * s  # de-normalise
-        r = r.view(n_samples, B, C, self.pred_len).permute(0, 1, 3, 2)
-        return base.unsqueeze(0) + r
+        """Return forecasts with shape [S, B, pred_len, C]."""
+        if n_samples is None:
+            n_samples = self.n_samples
 
-    # ------------------------------------------------------------------ forward
-    def forward(self, x, target=None, return_loss=False, loss_flag=0):
-        """ 
-        Standard inference: return [B, pred_len, C].
-        Joint-training mode: pass target and return_loss=True; this route is
-        DataParallel-safe because the loss is computed inside forward().
-        """
+        batch_size, _, channels = x.shape
+
+        base, seasonal_hist = self._dlinear(x)
+        cond, scale, chan_idx = self._condition(
+            x, base, seasonal_hist
+        )
+
+        residual = self._sample_residual(
+            cond, chan_idx, n_samples
+        )
+        residual = residual * self.res_std * scale
+
+        residual = (
+            residual
+            .view(
+                n_samples,
+                batch_size,
+                channels,
+                self.pred_len
+            )
+            .permute(0, 1, 3, 2)
+            .contiguous()
+        )
+
+        return base.unsqueeze(0) + residual
+
+    # -------------------------------------------------------------------------
+    # Forward
+    # -------------------------------------------------------------------------
+    def forward(
+        self,
+        x,
+        target=None,
+        return_loss=False,
+        loss_flag=0
+    ):
         if return_loss:
             if target is None:
-                raise ValueError('target is required when return_loss=True')
-            return self.compute_loss(x, target, loss_flag=loss_flag)
+                raise ValueError(
+                    "target is required when return_loss=True"
+                )
+            return self.compute_loss(
+                x, target, loss_flag=loss_flag
+            )
 
         if self.training and not self.sample_in_train:
             return self._dlinear(x)[0]
-        return self.sample(x).mean(0)  # [Batch, Output length, Channel]
 
+        return self.sample(x).mean(dim=0)
