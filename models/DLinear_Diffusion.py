@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+
 
 # ----------------------------------------------------------------------------
 # Original DLinear building blocks (unchanged)
@@ -192,15 +192,27 @@ class Model(nn.Module):
         return cond, s, chan_idx
 
     # ------------------------------------------------------------------ training
-    def compute_loss(self, x, y):
+    def compute_loss(self, x, y, loss_flag=0):
         """
-        x: [B, L, C] history, y: [B, pred_len, C] ground truth (slice y[:, -pred_len:] first).
-        Returns total loss and a dict of its parts.
-        The diffusion target is detached from DLinear, so the linear backbone is
-        trained only by the MSE term and stays identical to vanilla DLinear.
+        Jointly train DLinear and the conditional residual denoiser.
+
+        x: [B, seq_len, C]
+        y: [B, pred_len, C]
+        loss_flag follows Exp_Main:
+          1 = MAE, 2 = 0.5*MAE + 0.5*MSE, 3 = SmoothL1, otherwise MSE.
         """
         base, seasonal_hist = self._dlinear(x)
-        loss_base = F.mse_loss(base, y)
+
+        if loss_flag == 1:
+            loss_base = F.l1_loss(base, y)
+        elif loss_flag == 2:
+            loss_base = 0.5 * F.l1_loss(base, y) + 0.5 * F.mse_loss(base, y)
+        elif loss_flag == 3:
+            loss_base = F.smooth_l1_loss(base, y)
+        else:
+            # loss_flag=4 is an external PatchMixer-specific loss; use MSE
+            # for the DLinear base term rather than applying an incompatible loss.
+            loss_base = F.mse_loss(base, y)
 
         cond, s, chan_idx = self._condition(x, base, seasonal_hist)
         B, H, C = y.shape
@@ -253,8 +265,17 @@ class Model(nn.Module):
         return base.unsqueeze(0) + r
 
     # ------------------------------------------------------------------ forward
-    def forward(self, x):
-        # x: [Batch, Input length, Channel]
+    def forward(self, x, target=None, return_loss=False, loss_flag=0):
+        """ 
+        Standard inference: return [B, pred_len, C].
+        Joint-training mode: pass target and return_loss=True; this route is
+        DataParallel-safe because the loss is computed inside forward().
+        """
+        if return_loss:
+            if target is None:
+                raise ValueError('target is required when return_loss=True')
+            return self.compute_loss(x, target, loss_flag=loss_flag)
+
         if self.training and not self.sample_in_train:
             return self._dlinear(x)[0]
         return self.sample(x).mean(0)  # [Batch, Output length, Channel]
