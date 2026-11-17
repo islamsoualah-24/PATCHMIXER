@@ -239,7 +239,7 @@ class Model(nn.Module):
     def _sample_residual(self, cond, chan_idx, n_samples):
         """Deterministic DDIM sampling. Returns normalised residual [S, N, H]."""
         N = cond.size(0)
-        cond_emb = self.denoiser.encode_condition(cond, chan_idx).repeat(n_samples, 1)
+        cond_emb = self.denoiser.encode_condition(cond, chan_idx).repeat(n_samples, 20)
         r = torch.randn(n_samples * N, self.pred_len, device=cond.device)
 
         steps = torch.linspace(self.T - 1, 0, self.ddim_steps, device=cond.device).long()
