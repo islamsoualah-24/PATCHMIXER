@@ -5,6 +5,29 @@ import torch.nn.functional as F
 
 
 # -----------------------------------------------------------------------------
+# Peak-Sensitive Loss for Amplitude Correction
+# -----------------------------------------------------------------------------
+class PeakSensitiveLoss(nn.Module):
+    """
+    دالة تكلفة تعطي وزناً أكبر للأخطاء عند القيم المتطرفة (القمم والقيعان).
+    """
+    def __init__(self, alpha=2.0):
+        super(PeakSensitiveLoss, self).__init__()
+        self.alpha = alpha
+        self.mse = nn.MSELoss(reduction='none')
+
+    def forward(self, pred, target):
+        base_loss = self.mse(pred, target)
+        
+        # إعطاء وزن بناءً على القيمة المطلقة للهدف
+        # القيم الأبعد عن الصفر ستحصل على عقاب أكبر عند الخطأ
+        weights = 1.0 + self.alpha * torch.abs(target)
+        
+        weighted_loss = base_loss * weights
+        return weighted_loss.mean()
+
+
+# -----------------------------------------------------------------------------
 # Original DLinear building blocks
 # -----------------------------------------------------------------------------
 class moving_avg(nn.Module):
@@ -50,7 +73,7 @@ def timestep_embedding(t, dim):
     half = dim // 2
     freqs = torch.exp(
         -math.log(10000.0)
-        * torch.arange(half, device=t.device, dtype=torch.float32)
+        - torch.arange(half, device=t.device, dtype=torch.float32)
         / max(half, 1)
     )
     args = t.float()[:, None] * freqs[None, :]
@@ -175,7 +198,7 @@ class Model(nn.Module):
 
         self.T = g('diff_steps', 50)
         self.ddim_steps = min(g('ddim_steps', 10), self.T)
-        self.n_samples = g('n_samples', (50))
+        self.n_samples = g('n_samples', 50)
         self.diff_weight = g('diff_weight', 1.0)
         self.sample_in_train = g('sample_in_train', False)
         self.res_clip = g('res_clip', 5.0)
@@ -197,6 +220,9 @@ class Model(nn.Module):
             torch.cumprod(1.0 - betas, dim=0)
         )
         self.register_buffer('res_std', torch.ones(1))
+
+        # --- Peak Sensitive Loss ---
+        self.peak_loss = PeakSensitiveLoss(alpha=2.0)
 
     # -------------------------------------------------------------------------
     # DLinear forecast
@@ -278,6 +304,9 @@ class Model(nn.Module):
             )
         elif loss_flag == 3:
             loss_base = F.smooth_l1_loss(base, y)
+        elif loss_flag == 4:
+            # استخدام دالة التكلفة الحساسة للقمم
+            loss_base = self.peak_loss(base, y)
         else:
             loss_base = F.mse_loss(base, y)
 
