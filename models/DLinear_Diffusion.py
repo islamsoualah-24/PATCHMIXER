@@ -9,7 +9,8 @@ import torch.nn.functional as F
 # -----------------------------------------------------------------------------
 class PeakSensitiveLoss(nn.Module):
     """
-    دالة تكلفة تعطي وزناً أكبر للأخطاء عند القيم المتطرفة (القمم والقيعان).
+    دالة تكلفة تعطي وزناً أكبر للقمم والقيعان بعد مركزة البيانات
+    لتجنب مشكلة الإزاحة العمودية (Vertical Shift).
     """
     def __init__(self, alpha=2.0):
         super(PeakSensitiveLoss, self).__init__()
@@ -19,14 +20,13 @@ class PeakSensitiveLoss(nn.Module):
     def forward(self, pred, target):
         base_loss = self.mse(pred, target)
         
-        # إعطاء وزن بناءً على القيمة المطلقة للهدف
-        # القيم الأبعد عن الصفر ستحصل على عقاب أكبر عند الخطأ
-        weights = 1.0 + self.alpha * torch.abs(target)
+        target_mean = target.mean(dim=-1, keepdim=True)
+        target_centered = target - target_mean
+        
+        weights = 1.0 + self.alpha * torch.abs(target_centered)
         
         weighted_loss = base_loss * weights
         return weighted_loss.mean()
-
-
 # -----------------------------------------------------------------------------
 # Original DLinear building blocks
 # -----------------------------------------------------------------------------
