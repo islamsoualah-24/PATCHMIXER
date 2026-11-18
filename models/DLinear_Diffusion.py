@@ -173,14 +173,13 @@ class Model(nn.Module):
         # Diffusion configuration
         g = lambda key, default: getattr(configs, key, default)
 
-        self.T = g('diff_steps', 50)
-        self.ddim_steps = min(g('ddim_steps', 10), self.T)
+        self.T = g('diff_steps', 200) 
+        self.ddim_steps = min(g('ddim_steps', 20), self.T)
         self.n_samples = g('n_samples', 50)
         self.diff_weight = g('diff_weight', 1.0)
         self.sample_in_train = g('sample_in_train', False)
         self.res_clip = g('res_clip', 5.0)
 
-        # Fix: define self.d on Model; sampling uses this attribute.
         self.d = g('diff_hidden', 128)
 
         self.denoiser = ResidualDenoiser(
@@ -191,13 +190,26 @@ class Model(nn.Module):
             layers=g('diff_layers', 2)
         )
 
-        betas = torch.linspace(1e-4, 2e-2, self.T)
+        # استخدام Cosine بدلاً من Linear
+        betas = self._cosine_beta_schedule(self.T)
         self.register_buffer(
             'alpha_bar',
             torch.cumprod(1.0 - betas, dim=0)
         )
         self.register_buffer('res_std', torch.ones(1))
-
+        
+    def _cosine_beta_schedule(self, timesteps, s=0.008):
+        """
+        Cosine schedule as proposed in https://arxiv.org/abs/2102.09672
+        يساعد في الحفاظ على شكل القمم والقيعان بدلاً من تدميرها بسرعة.
+        """
+        steps = timesteps + 1
+        x = torch.linspace(0, timesteps, steps)
+        alphas_cumprod = torch.cos(((x / timesteps) + s) / (1.0 + s) * math.pi * 0.5) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        return torch.clip(betas, 0.0001, 0.999)
+        
     # -------------------------------------------------------------------------
     # DLinear forecast
     # -------------------------------------------------------------------------
