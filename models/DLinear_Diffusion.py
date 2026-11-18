@@ -169,17 +169,20 @@ class Model(nn.Module):
             self.Linear_Trend = nn.Linear(
                 self.seq_len, self.pred_len
             )
-
-        # Diffusion configuration
+        
         g = lambda key, default: getattr(configs, key, default)
 
-        self.T = g('diff_steps', 200) 
-        self.ddim_steps = min(g('ddim_steps', 20), self.T)
-        self.n_samples = g('n_samples', 50)
-        self.diff_weight = g('diff_weight', 1.0)
+        self.seq_len = g('seq_len', 512)
+        self.pred_len = g('pred_len', 96)
+        self.channels = g('enc_in', 7) # أو حسب عدد القنوات في بيانات ETTh1
+
+        self.T = g('diff_steps', 50) # العودة لـ 50 خطوة لتجنب العشوائية
+        self.ddim_steps = min(g('ddim_steps', 10), self.T)
+        self.n_samples = g('n_samples', 10) # تقليل العينات لتسريع التدريب
+        self.diff_weight = g('diff_weight', 0.1) 
+        
         self.sample_in_train = g('sample_in_train', False)
         self.res_clip = g('res_clip', 5.0)
-
         self.d = g('diff_hidden', 128)
 
         self.denoiser = ResidualDenoiser(
@@ -190,25 +193,14 @@ class Model(nn.Module):
             layers=g('diff_layers', 2)
         )
 
-        # استخدام Cosine بدلاً من Linear
-        betas = self._cosine_beta_schedule(self.T)
+        betas = torch.linspace(1e-4, 5e-3, self.T)
+        
         self.register_buffer(
             'alpha_bar',
             torch.cumprod(1.0 - betas, dim=0)
         )
         self.register_buffer('res_std', torch.ones(1))
-        
-    def _cosine_beta_schedule(self, timesteps, s=0.008):
-        """
-        Cosine schedule as proposed in https://arxiv.org/abs/2102.09672
-        يساعد في الحفاظ على شكل القمم والقيعان بدلاً من تدميرها بسرعة.
-        """
-        steps = timesteps + 1
-        x = torch.linspace(0, timesteps, steps)
-        alphas_cumprod = torch.cos(((x / timesteps) + s) / (1.0 + s) * math.pi * 0.5) ** 2
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return torch.clip(betas, 0.0001, 0.999)
+    
         
     # -------------------------------------------------------------------------
     # DLinear forecast
