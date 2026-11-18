@@ -12,7 +12,7 @@ class PeakSensitiveLoss(nn.Module):
     دالة تكلفة تعطي وزناً أكبر للقمم والقيعان بعد مركزة البيانات
     لتجنب مشكلة الإزاحة العمودية (Vertical Shift).
     """
-    def __init__(self, alpha=1.0):
+    def __init__(self, alpha=0.5):
         super(PeakSensitiveLoss, self).__init__()
         self.alpha = alpha
         self.mse = nn.MSELoss(reduction='none')
