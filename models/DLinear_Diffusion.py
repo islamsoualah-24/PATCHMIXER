@@ -169,20 +169,18 @@ class Model(nn.Module):
             self.Linear_Trend = nn.Linear(
                 self.seq_len, self.pred_len
             )
-        
+
+        # Diffusion configuration
         g = lambda key, default: getattr(configs, key, default)
 
-        self.seq_len = g('seq_len', 512)
-        self.pred_len = g('pred_len', 96)
-        self.channels = g('enc_in', 7) # أو حسب عدد القنوات في بيانات ETTh1
-
-        self.T = g('diff_steps', 50) # العودة لـ 50 خطوة لتجنب العشوائية
+        self.T = g('diff_steps', 50)
         self.ddim_steps = min(g('ddim_steps', 10), self.T)
-        self.n_samples = g('n_samples', 10) # تقليل العينات لتسريع التدريب
-        self.diff_weight = g('diff_weight', 0.1) 
-        
+        self.n_samples = g('n_samples', 20)
+        self.diff_weight = g('diff_weight', 1.0)
         self.sample_in_train = g('sample_in_train', False)
         self.res_clip = g('res_clip', 5.0)
+
+        # Fix: define self.d on Model; sampling uses this attribute.
         self.d = g('diff_hidden', 128)
 
         self.denoiser = ResidualDenoiser(
@@ -193,15 +191,13 @@ class Model(nn.Module):
             layers=g('diff_layers', 2)
         )
 
-        betas = torch.linspace(1e-4, 5e-3, self.T)
-        
+        betas = torch.linspace(1e-4, 2e-2, self.T)
         self.register_buffer(
             'alpha_bar',
             torch.cumprod(1.0 - betas, dim=0)
         )
         self.register_buffer('res_std', torch.ones(1))
-    
-        
+
     # -------------------------------------------------------------------------
     # DLinear forecast
     # -------------------------------------------------------------------------
