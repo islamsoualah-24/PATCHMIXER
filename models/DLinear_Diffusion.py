@@ -222,7 +222,7 @@ class Model(nn.Module):
         self.register_buffer('res_std', torch.ones(1))
 
         # --- Peak Sensitive Loss ---
-        self.peak_loss = PeakSensitiveLoss(alpha=2.0)
+        self.peak_loss = PeakSensitiveLoss(alpha=0.5)
 
     # -------------------------------------------------------------------------
     # DLinear forecast
