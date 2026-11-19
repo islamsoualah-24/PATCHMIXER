@@ -484,4 +484,9 @@ class Model(nn.Module):
         if self.training and not self.sample_in_train:
             return self._dlinear(x)[0]
 
-        return self.sample(x).mean(dim=0)
+        
+        
+        # هذا التعديل يوازن بين تقليل MAE والحفاظ على بعض الحدة
+        samples = self.sample(x) # [n_samples, B, pred_len, C]
+        return samples.median(dim=0).values
+
