@@ -8,11 +8,8 @@ import torch.nn.functional as F
 # Peak-Sensitive Loss for Amplitude Correction
 # -----------------------------------------------------------------------------
 class PeakSensitiveLoss(nn.Module):
-    """
-    دالة تكلفة تعطي وزناً أكبر للقمم والقيعان بعد مركزة البيانات
-    لتجنب مشكلة الإزاحة العمودية (Vertical Shift).
-    """
-    def __init__(self, alpha=0.5):
+
+    def __init__(self, alpha=0.2):
         super(PeakSensitiveLoss, self).__init__()
         self.alpha = alpha
         self.mse = nn.MSELoss(reduction='none')
@@ -222,7 +219,7 @@ class Model(nn.Module):
         self.register_buffer('res_std', torch.ones(1))
 
         # --- Peak Sensitive Loss ---
-        self.peak_loss = PeakSensitiveLoss(alpha=0.5)
+        self.peak_loss = PeakSensitiveLoss(alpha=0.2)
 
     # -------------------------------------------------------------------------
     # DLinear forecast
