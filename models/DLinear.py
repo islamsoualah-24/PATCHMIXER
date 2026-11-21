@@ -52,38 +52,50 @@ class MultiScale_SeriesDecomp(nn.Module):
 
 class Model(nn.Module):
     """
-    Multi-Scale Decomposition-Linear (MS-DLinear)
+    Non-Linear Multi-Scale Decomposition (NL-MS-DLinear)
     """
     def __init__(self, configs):
         super(Model, self).__init__()
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
-
-        # أحجام النوافذ المتعددة (مقاييس مختلفة للزمن: أسبوعي، نص شهري، شهري، الخ)
-        # يجب أن تكون الأرقام فردية (Odd)
-        kernel_sizes = [7, 15, 25, 51] 
         
-        # استخدام التفكيك الجديد بدلاً من: series_decomp(kernel_size)
+        # بُعد مخفي للشبكة غير الخطية (يمكنك تعديله، 64 أو 128 عادة ما تعطي نتائج جيدة)
+        d_hidden = 128 
+        dropout = 0.1
+
+        kernel_sizes = [7, 15, 25, 51] 
         self.decompsition = MultiScale_SeriesDecomp(kernel_sizes)
         
         self.individual = configs.individual
         self.channels = configs.enc_in
 
         if self.individual:
-            self.Linear_Seasonal = nn.ModuleList()
             self.Linear_Trend = nn.ModuleList()
+            self.MLP_Seasonal = nn.ModuleList() # تغيير الاسم ليناسب المعمارية الجديدة
             
             for i in range(self.channels):
-                self.Linear_Seasonal.append(nn.Linear(self.seq_len, self.pred_len))
+                # الاتجاه يبقى خطياً
                 self.Linear_Trend.append(nn.Linear(self.seq_len, self.pred_len))
+                # الجزء الموسمي يصبح غير خطي لالتقاط القمم الحادة
+                self.MLP_Seasonal.append(
+                    nn.Sequential(
+                        nn.Linear(self.seq_len, d_hidden),
+                        nn.GELU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(d_hidden, self.pred_len)
+                    )
+                )
         else:
-            self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
             self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
+            self.MLP_Seasonal = nn.Sequential(
+                nn.Linear(self.seq_len, d_hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_hidden, self.pred_len)
+            )
 
     def forward(self, x):
         # x: [Batch, Input length, Channel]
-        
-        # الدالة الجديدة تُرجع نفس المخرجات المتوقعة (موسمي، اتجاه)
         seasonal_init, trend_init = self.decompsition(x)
         seasonal_init, trend_init = seasonal_init.permute(0, 2, 1), trend_init.permute(0, 2, 1)
         
@@ -91,10 +103,10 @@ class Model(nn.Module):
             seasonal_output = torch.zeros([seasonal_init.size(0), seasonal_init.size(1), self.pred_len], dtype=seasonal_init.dtype).to(seasonal_init.device)
             trend_output = torch.zeros([trend_init.size(0), trend_init.size(1), self.pred_len], dtype=trend_init.dtype).to(trend_init.device)
             for i in range(self.channels):
-                seasonal_output[:, i, :] = self.Linear_Seasonal[i](seasonal_init[:, i, :])
+                seasonal_output[:, i, :] = self.MLP_Seasonal[i](seasonal_init[:, i, :])
                 trend_output[:, i, :] = self.Linear_Trend[i](trend_init[:, i, :])
         else:
-            seasonal_output = self.Linear_Seasonal(seasonal_init)
+            seasonal_output = self.MLP_Seasonal(seasonal_init)
             trend_output = self.Linear_Trend(trend_init)
 
         x = seasonal_output + trend_output
