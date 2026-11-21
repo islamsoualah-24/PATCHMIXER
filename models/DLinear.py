@@ -84,11 +84,14 @@ class series_decomp(nn.Module):
 # ==========================================
 # 3. النموذج الكامل (DLinear + RevIN)
 # ==========================================
-class DLinear_RevIN(nn.Module):
-    def __init__(self, seq_len, pred_len, enc_in, kernel_size=25):
-        super(DLinear_RevIN, self).__init__()
-        self.seq_len = seq_len
-        self.pred_len = pred_len
+class Model(nn.Module): 
+    def __init__(self, configs): 
+        super(Model, self).__init__()
+        # استخراج المتغيرات من configs
+        self.seq_len = configs.seq_len
+        self.pred_len = configs.pred_len
+        enc_in = configs.enc_in
+        kernel_size = 25 
         
         # 1. طبقة التقييس RevIN
         self.revin = RevIN(num_features=enc_in)
