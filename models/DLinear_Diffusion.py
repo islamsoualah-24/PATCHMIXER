@@ -68,17 +68,17 @@ class PositionalEncoding(nn.Module):
         # x shape: [Batch, Seq_len, d_model]
         return x + self.pe[:, :x.size(1), :]
 
-class TransformerResidualDenoiser(nn.Module):
+class CNNResidualDenoiser(nn.Module):
     """
-    شبكة إزالة الضجيج تعتمد على Transformers بدلاً من MLP.
-    Predict epsilon_theta(r_t, t | history, base forecast).
+    شبكة إزالة ضجيج سريعة تعتمد على 1D-CNN بدلاً من Transformers.
+    تخفض التعقيد الحسابي من O(L^2) إلى O(L) وتسرع الاستدلال بشكل كبير.
     """
-    def __init__(self, seq_len, pred_len, channels, d=128, nheads=4, layers=2):
+    def __init__(self, seq_len, pred_len, channels, d=128, layers=2):
         super().__init__()
         self.d = d
         self.pred_len = pred_len
         
-        # تشفير الشرط (Condition)
+        # 1. تشفير الشرط (نفس السابق)
         self.cond_enc = nn.Sequential(
             nn.Linear(seq_len + pred_len, d),
             nn.GELU(),
@@ -91,25 +91,24 @@ class TransformerResidualDenoiser(nn.Module):
             nn.Linear(d, d)
         )
         
-        # تحضير السلسلة للمحول
-        self.in_proj = nn.Linear(1, d)
-        self.pos_encoder = PositionalEncoding(d_model=d, max_len=pred_len)
+        # 2. طبقات الالتفاف (CNN)
+        # تحويل [N, 1, pred_len] إلى [N, d, pred_len]
+        self.in_proj = nn.Conv1d(1, d, kernel_size=3, padding=1)
         
-        # طبقات المحول (Transformer)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d, 
-            nhead=nheads, 
-            dim_feedforward=d * 2, 
-            dropout=0.1, 
-            batch_first=True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=layers)
+        # كتل التفافية مع وصلات متبقية (Residual CNN Blocks)
+        self.cnn_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(d, d, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv1d(d, d, kernel_size=3, padding=1)
+            ) for _ in range(layers)
+        ])
         
-        # طبقة الإخراج
+        # 3. طبقة الإخراج
         self.out_norm = nn.LayerNorm(d)
-        self.out_proj = nn.Linear(d, 1)
+        self.out_proj = nn.Conv1d(d, 1, kernel_size=3, padding=1)
         
-        # تهيئة بأصفار لبدء مستقر
+        # تهيئة طبقة الخروج بأصفار
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
@@ -117,26 +116,28 @@ class TransformerResidualDenoiser(nn.Module):
         return self.cond_enc(cond) + self.chan_emb(chan_idx)
 
     def forward(self, r_t, t, cond_emb):
-        # r_t shape: [N, pred_len]
-        
+        # أ. تحضير الشرط
         c = cond_emb + self.t_mlp(timestep_embedding(t, self.d))
-        c = c.unsqueeze(1) # [N, 1, d]
+        # تغيير الشكل إلى [N, d, 1] ليتم جمعه مع كل النقاط الزمنية بسهولة
+        c = c.unsqueeze(-1) 
         
-        # تحويل البواقي إلى سلسلة زمنية
-        x = r_t.unsqueeze(-1) # [N, pred_len, 1]
-        x = self.in_proj(x)   # [N, pred_len, d]
+        # ب. تحضير السلسلة الزمنية
+        x = r_t.unsqueeze(1) # [N, 1, pred_len]
+        x = self.in_proj(x)  # [N, d, pred_len]
         
-        x = self.pos_encoder(x)
-        x = x + c # إضافة التوجيه
+        # ج. التمرير عبر طبقات CNN مع دمج الشرط
+        for block in self.cnn_blocks:
+            h = x + c  # إضافة التوجيه
+            x = x + block(h) # وصلة متبقية (Residual Connection)
+            
+        # د. التسوية (Normalization)
+        x = x.permute(0, 2, 1) # [N, pred_len, d]
+        x = self.out_norm(x)
+        x = x.permute(0, 2, 1) # العودة إلى [N, d, pred_len]
         
-        out = self.transformer_encoder(x) # [N, pred_len, d]
-        
-        out = self.out_norm(out)
-        out = self.out_proj(out).squeeze(-1) # [N, pred_len]
-        
+        # هـ. الإخراج النهائي
+        out = self.out_proj(x).squeeze(1) # [N, pred_len]
         return out
-
-
 # -----------------------------------------------------------------------------
 # 4. Model (DLinear + Conditional Diffusion)
 # -----------------------------------------------------------------------------
@@ -178,14 +179,12 @@ class Model(nn.Module):
         self.res_clip = g('res_clip', 5.0)
         self.d = g('diff_hidden', 128)
 
-        # استدعاء المحول الجديد بدلاً من الشبكة القديمة
-        self.denoiser = TransformerResidualDenoiser(
+        self.denoiser = CNNResidualDenoiser(
             self.seq_len,
             self.pred_len,
             self.channels,
             d=self.d,
-            nheads=4,
-            layers=g('diff_layers', 2)
+            layers=g('diff_layers', 2) # يمكنك زيادة عدد الطبقات لتعويض بساطة CNN
         )
 
         betas = torch.linspace(1e-4, 2e-2, self.T)
