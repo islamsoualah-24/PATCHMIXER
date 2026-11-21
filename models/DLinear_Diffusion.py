@@ -3,16 +3,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# استيراد طبقة Mamba
-# يجب تثبيت المكتبة أولاً: pip install mamba-ssm causal-conv1d
-try:
-    from mamba_ssm import Mamba
-except ImportError:
-    raise ImportError("Please install mamba-ssm: pip install mamba-ssm causal-conv1d")
-
 
 # =============================================================================
-# 1. كتل بناء DLinear الأصلية (DLinear Building Blocks)
+# 1. كتل بناء DLinear الأصلية
 # =============================================================================
 class moving_avg(nn.Module):
     """Moving average block to highlight the trend of time series."""
@@ -42,10 +35,88 @@ class series_decomp(nn.Module):
 
 
 # =============================================================================
-# 2. كتل بناء Mamba Diffusion (التحسين الجديد)
+# 2. تنفيذ Mamba بـ PyTorch الخالص (بدون الحاجة لتثبيت mamba-ssm)
+# =============================================================================
+class PurePyTorchMamba(nn.Module):
+    """
+    تنفيذ كامل لطبقة Mamba (Selective State Space Model) باستخدام PyTorch فقط.
+    """
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.d_inner = int(expand * d_model)
+        self.dt_rank = math.ceil(d_model / 16)
+
+        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
+
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            bias=True,
+            kernel_size=d_conv,
+            groups=self.d_inner,
+            padding=d_conv - 1,
+        )
+
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+
+        A = torch.arange(1, self.d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+
+    def selective_scan(self, u, delta, A, B, C, D):
+        """المعادلة التكرارية لـ Mamba (Selective Scan)"""
+        b, l, d_in = u.shape
+        n = A.shape[1]
+
+        deltaA = torch.exp(torch.einsum('bld,dn->bldn', delta, A))
+        deltaB_u = torch.einsum('bld,bln,bld->bldn', delta, B, u)
+
+        x = torch.zeros((b, d_in, n), device=u.device, dtype=u.dtype)
+        ys = []
+        for i in range(l):
+            x = deltaA[:, i] * x + deltaB_u[:, i]
+            y = torch.einsum('bdn,bn->bd', x, C[:, i])
+            ys.append(y)
+
+        y = torch.stack(ys, dim=1)  # [b, l, d_in]
+        y = y + u * D
+        return y
+
+    def forward(self, x):
+        # x: [Batch, Length, d_model]
+        b, l, _ = x.shape
+
+        x_and_res = self.in_proj(x)
+        x_in, res = x_and_res.split([self.d_inner, self.d_inner], dim=-1)
+
+        # Causal Conv1D
+        x_in = x_in.transpose(1, 2)
+        x_in = self.conv1d(x_in)[:, :, :l]
+        x_in = x_in.transpose(1, 2)
+        x_in = F.silu(x_in)
+
+        # SSM Parameters
+        x_dbl = self.x_proj(x_in)
+        delta, B, C = x_dbl.split([self.dt_rank, self.d_state, self.d_state], dim=-1)
+        delta = F.softplus(self.dt_proj(delta))
+        A = -torch.exp(self.A_log.float())
+
+        # Selective Scan
+        y = self.selective_scan(x_in, delta, A, B, C, self.D)
+        y = y * F.silu(res)
+
+        return self.out_proj(y)
+
+
+# =============================================================================
+# 3. شبكة إزالة الضجيج (Denoiser) باستخدام Mamba
 # =============================================================================
 def timestep_embedding(t, dim):
-    """Sinusoidal embedding: t [N] -> [N, dim]."""
     half = dim // 2
     freqs = torch.exp(
         -math.log(10000.0)
@@ -60,42 +131,25 @@ def timestep_embedding(t, dim):
 
 
 class MambaDiffusionBlock(nn.Module):
-    """كتلة Mamba مجهزة لاستقبال شرط الزمن والسياق (FiLM)"""
     def __init__(self, d):
         super().__init__()
-        self.mamba = Mamba(
-            d_model=d,       # بُعد التضمين
-            d_state=16,      # حجم الحالة المخفية
-            d_conv=4,        # حجم النواة
-            expand=2,        # عامل التوسيع
-        )
+        self.mamba = PurePyTorchMamba(d_model=d, d_state=16, d_conv=4, expand=2)
         self.norm = nn.LayerNorm(d, elementwise_affine=False)
         self.film = nn.Linear(d, 2 * d)
 
     def forward(self, h, c):
-        # h: [N, pred_len, d]
-        # c: [N, d]
-        scale, shift = self.film(c).unsqueeze(1).chunk(2, dim=-1) # [N, 1, d]
-        
-        # FiLM Modulation
+        scale, shift = self.film(c).unsqueeze(1).chunk(2, dim=-1)
         h_conditioned = self.norm(h) * (1 + scale) + shift
-        
-        # Mamba مع Residual Connection
         return h + self.mamba(h_conditioned)
 
 
 class ResidualDenoiserMamba(nn.Module):
-    """
-    Predict epsilon_theta(r_t, t | history, base forecast) using Mamba.
-    """
     def __init__(self, seq_len, pred_len, channels, d=128, layers=2):
         super().__init__()
         self.d = d
         self.pred_len = pred_len
-        
-        # الإسقاط من بُعد 1 إلى d للحفاظ على التسلسل الزمني
         self.in_proj = nn.Linear(1, d)
-        
+
         self.cond_enc = nn.Sequential(
             nn.Linear(seq_len + pred_len, d),
             nn.GELU(),
@@ -107,16 +161,11 @@ class ResidualDenoiserMamba(nn.Module):
             nn.GELU(),
             nn.Linear(d, d)
         )
-        
-        # استخدام Mamba كبديل لـ MLPs
+
         self.blocks = nn.ModuleList([MambaDiffusionBlock(d) for _ in range(layers)])
-        
         self.out_norm = nn.LayerNorm(d)
-        
-        # الإخراج إلى بُعد 1
         self.out_proj = nn.Linear(d, 1)
 
-        # Start by predicting zero noise
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
@@ -124,30 +173,22 @@ class ResidualDenoiserMamba(nn.Module):
         return self.cond_enc(cond) + self.chan_emb(chan_idx)
 
     def forward(self, r_t, t, cond_emb):
-        # تجهيز الشرط
         c = cond_emb + self.t_mlp(timestep_embedding(t, self.d))
-        
-        # الحفاظ على طول السلسلة الزمنية [N, pred_len, 1]
         r_t_seq = r_t.unsqueeze(-1)
-        h = self.in_proj(r_t_seq) # [N, pred_len, d]
-        
+        h = self.in_proj(r_t_seq)
+
         for block in self.blocks:
             h = block(h, c)
-            
+
         h = self.out_norm(h)
-        out = self.out_proj(h) # [N, pred_len, 1]
-        
-        return out.squeeze(-1) # الرجوع إلى [N, pred_len]
+        out = self.out_proj(h)
+        return out.squeeze(-1)
 
 
 # =============================================================================
-# 3. النموذج الهجين: DLinear + Mamba Conditional Diffusion
+# 4. النموذج الهجين الكامل: DLinear + Mamba Conditional Diffusion
 # =============================================================================
 class Model(nn.Module):
-    """
-    DLinear + Mamba Diffusion.
-    Forecast = DLinear forecast + diffusion-generated residual (via Mamba).
-    """
     def __init__(self, configs):
         super(Model, self).__init__()
 
@@ -156,7 +197,6 @@ class Model(nn.Module):
         self.channels = configs.enc_in
         self.individual = configs.individual
 
-        # Original DLinear Base
         kernel_size = 25
         self.decompsition = series_decomp(kernel_size)
 
@@ -170,7 +210,6 @@ class Model(nn.Module):
             self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
             self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
 
-        # Diffusion configuration
         g = lambda key, default: getattr(configs, key, default)
 
         self.T = g('diff_steps', 50)
@@ -181,7 +220,6 @@ class Model(nn.Module):
         self.res_clip = g('res_clip', 5.0)
         self.d = g('diff_hidden', 128)
 
-        # <<< التغيير هنا: استخدام شبكة Mamba >>>
         self.denoiser = ResidualDenoiserMamba(
             self.seq_len,
             self.pred_len,
