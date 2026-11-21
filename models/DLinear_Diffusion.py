@@ -3,9 +3,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# -----------------------------------------------------------------------------
-# 1. DLinear building blocks (التوقع الأساسي)
-# -----------------------------------------------------------------------------
+# استيراد طبقة Mamba
+# يجب تثبيت المكتبة أولاً: pip install mamba-ssm causal-conv1d
+try:
+    from mamba_ssm import Mamba
+except ImportError:
+    raise ImportError("Please install mamba-ssm: pip install mamba-ssm causal-conv1d")
+
+
+# =============================================================================
+# 1. كتل بناء DLinear الأصلية (DLinear Building Blocks)
+# =============================================================================
 class moving_avg(nn.Module):
     """Moving average block to highlight the trend of time series."""
     def __init__(self, kernel_size, stride):
@@ -33,15 +41,16 @@ class series_decomp(nn.Module):
         return res, moving_mean
 
 
-# -----------------------------------------------------------------------------
-# 2. Diffusion Timestep Embedding
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 2. كتل بناء Mamba Diffusion (التحسين الجديد)
+# =============================================================================
 def timestep_embedding(t, dim):
     """Sinusoidal embedding: t [N] -> [N, dim]."""
     half = dim // 2
     freqs = torch.exp(
         -math.log(10000.0)
-        - torch.arange(half, device=t.device, dtype=torch.float32) / max(half, 1)
+        - torch.arange(half, device=t.device, dtype=torch.float32)
+        / max(half, 1)
     )
     args = t.float()[:, None] * freqs[None, :]
     emb = torch.cat([args.sin(), args.cos()], dim=-1)
@@ -50,35 +59,43 @@ def timestep_embedding(t, dim):
     return emb
 
 
-# -----------------------------------------------------------------------------
-# 3. NEW: Transformer-Based Residual Denoiser (التحسين الجديد)
-# -----------------------------------------------------------------------------
-class PositionalEncoding(nn.Module):
-    """تضمين المواقع لتمكين المحول من فهم التسلسل الزمني"""
-    def __init__(self, d_model, max_len=5000):
+class MambaDiffusionBlock(nn.Module):
+    """كتلة Mamba مجهزة لاستقبال شرط الزمن والسياق (FiLM)"""
+    def __init__(self, d):
         super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe.unsqueeze(0)) # [1, max_len, d_model]
+        self.mamba = Mamba(
+            d_model=d,       # بُعد التضمين
+            d_state=16,      # حجم الحالة المخفية
+            d_conv=4,        # حجم النواة
+            expand=2,        # عامل التوسيع
+        )
+        self.norm = nn.LayerNorm(d, elementwise_affine=False)
+        self.film = nn.Linear(d, 2 * d)
 
-    def forward(self, x):
-        # x shape: [Batch, Seq_len, d_model]
-        return x + self.pe[:, :x.size(1), :]
+    def forward(self, h, c):
+        # h: [N, pred_len, d]
+        # c: [N, d]
+        scale, shift = self.film(c).unsqueeze(1).chunk(2, dim=-1) # [N, 1, d]
+        
+        # FiLM Modulation
+        h_conditioned = self.norm(h) * (1 + scale) + shift
+        
+        # Mamba مع Residual Connection
+        return h + self.mamba(h_conditioned)
 
-class CNNResidualDenoiser(nn.Module):
+
+class ResidualDenoiserMamba(nn.Module):
     """
-    شبكة إزالة ضجيج سريعة تعتمد على 1D-CNN بدلاً من Transformers.
-    تخفض التعقيد الحسابي من O(L^2) إلى O(L) وتسرع الاستدلال بشكل كبير.
+    Predict epsilon_theta(r_t, t | history, base forecast) using Mamba.
     """
     def __init__(self, seq_len, pred_len, channels, d=128, layers=2):
         super().__init__()
         self.d = d
         self.pred_len = pred_len
         
-        # 1. تشفير الشرط (نفس السابق)
+        # الإسقاط من بُعد 1 إلى d للحفاظ على التسلسل الزمني
+        self.in_proj = nn.Linear(1, d)
+        
         self.cond_enc = nn.Sequential(
             nn.Linear(seq_len + pred_len, d),
             nn.GELU(),
@@ -91,24 +108,15 @@ class CNNResidualDenoiser(nn.Module):
             nn.Linear(d, d)
         )
         
-        # 2. طبقات الالتفاف (CNN)
-        # تحويل [N, 1, pred_len] إلى [N, d, pred_len]
-        self.in_proj = nn.Conv1d(1, d, kernel_size=3, padding=1)
+        # استخدام Mamba كبديل لـ MLPs
+        self.blocks = nn.ModuleList([MambaDiffusionBlock(d) for _ in range(layers)])
         
-        # كتل التفافية مع وصلات متبقية (Residual CNN Blocks)
-        self.cnn_blocks = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv1d(d, d, kernel_size=3, padding=1),
-                nn.GELU(),
-                nn.Conv1d(d, d, kernel_size=3, padding=1)
-            ) for _ in range(layers)
-        ])
-        
-        # 3. طبقة الإخراج
         self.out_norm = nn.LayerNorm(d)
-        self.out_proj = nn.Conv1d(d, 1, kernel_size=3, padding=1)
         
-        # تهيئة طبقة الخروج بأصفار
+        # الإخراج إلى بُعد 1
+        self.out_proj = nn.Linear(d, 1)
+
+        # Start by predicting zero noise
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
@@ -116,47 +124,41 @@ class CNNResidualDenoiser(nn.Module):
         return self.cond_enc(cond) + self.chan_emb(chan_idx)
 
     def forward(self, r_t, t, cond_emb):
-        # أ. تحضير الشرط
+        # تجهيز الشرط
         c = cond_emb + self.t_mlp(timestep_embedding(t, self.d))
-        # تغيير الشكل إلى [N, d, 1] ليتم جمعه مع كل النقاط الزمنية بسهولة
-        c = c.unsqueeze(-1) 
         
-        # ب. تحضير السلسلة الزمنية
-        x = r_t.unsqueeze(1) # [N, 1, pred_len]
-        x = self.in_proj(x)  # [N, d, pred_len]
+        # الحفاظ على طول السلسلة الزمنية [N, pred_len, 1]
+        r_t_seq = r_t.unsqueeze(-1)
+        h = self.in_proj(r_t_seq) # [N, pred_len, d]
         
-        # ج. التمرير عبر طبقات CNN مع دمج الشرط
-        for block in self.cnn_blocks:
-            h = x + c  # إضافة التوجيه
-            x = x + block(h) # وصلة متبقية (Residual Connection)
+        for block in self.blocks:
+            h = block(h, c)
             
-        # د. التسوية (Normalization)
-        x = x.permute(0, 2, 1) # [N, pred_len, d]
-        x = self.out_norm(x)
-        x = x.permute(0, 2, 1) # العودة إلى [N, d, pred_len]
+        h = self.out_norm(h)
+        out = self.out_proj(h) # [N, pred_len, 1]
         
-        # هـ. الإخراج النهائي
-        out = self.out_proj(x).squeeze(1) # [N, pred_len]
-        return out
-# -----------------------------------------------------------------------------
-# 4. Model (DLinear + Conditional Diffusion)
-# -----------------------------------------------------------------------------
+        return out.squeeze(-1) # الرجوع إلى [N, pred_len]
+
+
+# =============================================================================
+# 3. النموذج الهجين: DLinear + Mamba Conditional Diffusion
+# =============================================================================
 class Model(nn.Module):
     """
-    DLinear-Diffusion with Transformer Denoiser.
-    Forecast = DLinear forecast + diffusion-generated residual.
+    DLinear + Mamba Diffusion.
+    Forecast = DLinear forecast + diffusion-generated residual (via Mamba).
     """
     def __init__(self, configs):
         super(Model, self).__init__()
 
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
+        self.channels = configs.enc_in
+        self.individual = configs.individual
 
-        # Original DLinear
+        # Original DLinear Base
         kernel_size = 25
         self.decompsition = series_decomp(kernel_size)
-        self.individual = configs.individual
-        self.channels = configs.enc_in
 
         if self.individual:
             self.Linear_Seasonal = nn.ModuleList()
@@ -179,21 +181,19 @@ class Model(nn.Module):
         self.res_clip = g('res_clip', 5.0)
         self.d = g('diff_hidden', 128)
 
-        self.denoiser = CNNResidualDenoiser(
+        # <<< التغيير هنا: استخدام شبكة Mamba >>>
+        self.denoiser = ResidualDenoiserMamba(
             self.seq_len,
             self.pred_len,
             self.channels,
             d=self.d,
-            layers=g('diff_layers', 2) # يمكنك زيادة عدد الطبقات لتعويض بساطة CNN
+            layers=g('diff_layers', 2)
         )
 
         betas = torch.linspace(1e-4, 2e-2, self.T)
         self.register_buffer('alpha_bar', torch.cumprod(1.0 - betas, dim=0))
         self.register_buffer('res_std', torch.ones(1))
 
-    # -------------------------------------------------------------------------
-    # DLinear forecast
-    # -------------------------------------------------------------------------
     def _dlinear(self, x):
         seasonal_init, trend_init = self.decompsition(x)
         seasonal_init = seasonal_init.permute(0, 2, 1)
@@ -218,9 +218,6 @@ class Model(nn.Module):
         base = (seasonal_output + trend_output).permute(0, 2, 1)
         return base, seasonal_init
 
-    # -------------------------------------------------------------------------
-    # Build conditioning information
-    # -------------------------------------------------------------------------
     def _condition(self, x, base, seasonal_hist):
         batch_size, seq_len, channels = x.shape
 
@@ -238,9 +235,6 @@ class Model(nn.Module):
 
         return cond, scale, chan_idx
 
-    # -------------------------------------------------------------------------
-    # Joint training loss
-    # -------------------------------------------------------------------------
     def compute_loss(self, x, y, loss_flag=0):
         base, seasonal_hist = self._dlinear(x)
 
@@ -256,11 +250,7 @@ class Model(nn.Module):
         cond, scale, chan_idx = self._condition(x, base, seasonal_hist)
         batch_size, horizon, channels = y.shape
 
-        residual = (
-            (y - base).detach()
-            .permute(0, 2, 1)
-            .reshape(batch_size * channels, horizon) / scale
-        )
+        residual = (y - base).detach().permute(0, 2, 1).reshape(batch_size * channels, horizon) / scale
 
         if self.training:
             with torch.no_grad():
@@ -273,10 +263,7 @@ class Model(nn.Module):
         noise = torch.randn_like(residual_norm)
         alpha_bar_t = self.alpha_bar[t][:, None]
 
-        noisy_residual = (
-            alpha_bar_t.sqrt() * residual_norm
-            + (1.0 - alpha_bar_t).sqrt() * noise
-        )
+        noisy_residual = alpha_bar_t.sqrt() * residual_norm + (1.0 - alpha_bar_t).sqrt() * noise
 
         cond_emb = self.denoiser.encode_condition(cond, chan_idx)
         predicted_noise = self.denoiser(noisy_residual, t, cond_emb)
@@ -284,18 +271,11 @@ class Model(nn.Module):
 
         total_loss = loss_base + self.diff_weight * loss_diff
 
-        return total_loss, {
-            'base': loss_base.detach(),
-            'diff': loss_diff.detach()
-        }
+        return total_loss, {'base': loss_base.detach(), 'diff': loss_diff.detach()}
 
-    # -------------------------------------------------------------------------
-    # DDIM residual sampling
-    # -------------------------------------------------------------------------
     @torch.no_grad()
     def _sample_residual(self, cond, chan_idx, n_samples):
         num_series = cond.size(0)
-
         cond_emb = self.denoiser.encode_condition(cond, chan_idx)
         cond_emb = cond_emb.repeat_interleave(n_samples, dim=0)
 
@@ -308,40 +288,19 @@ class Model(nn.Module):
 
         for i, timestep in enumerate(steps):
             alpha_bar_t = self.alpha_bar[timestep]
+            alpha_bar_prev = self.alpha_bar[steps[i + 1]] if i + 1 < len(steps) else cond.new_tensor(1.0)
 
-            if i + 1 < len(steps):
-                alpha_bar_prev = self.alpha_bar[steps[i + 1]]
-            else:
-                alpha_bar_prev = cond.new_tensor(1.0)
-
-            t_batch = torch.full(
-                (residual.size(0),), int(timestep.item()),
-                device=cond.device, dtype=torch.long
-            )
+            t_batch = torch.full((residual.size(0),), int(timestep.item()), device=cond.device, dtype=torch.long)
 
             predicted_noise = self.denoiser(residual, t_batch, cond_emb)
 
-            predicted_residual = (
-                residual - (1.0 - alpha_bar_t).sqrt() * predicted_noise
-            ) / alpha_bar_t.sqrt()
-
+            predicted_residual = (residual - (1.0 - alpha_bar_t).sqrt() * predicted_noise) / alpha_bar_t.sqrt()
             predicted_residual = predicted_residual.clamp(-self.res_clip, self.res_clip)
+            predicted_noise = (residual - alpha_bar_t.sqrt() * predicted_residual) / (1.0 - alpha_bar_t).sqrt().clamp_min(1e-8)
 
-            predicted_noise = (
-                residual - alpha_bar_t.sqrt() * predicted_residual
-            ) / (1.0 - alpha_bar_t).sqrt().clamp_min(1e-8)
+            residual = alpha_bar_prev.sqrt() * predicted_residual + (1.0 - alpha_bar_prev).sqrt() * predicted_noise
 
-            residual = (
-                alpha_bar_prev.sqrt() * predicted_residual
-                + (1.0 - alpha_bar_prev).sqrt() * predicted_noise
-            )
-
-        return (
-            residual
-            .view(num_series, n_samples, self.pred_len)
-            .permute(1, 0, 2)
-            .contiguous()
-        )
+        return residual.view(num_series, n_samples, self.pred_len).permute(1, 0, 2).contiguous()
 
     @torch.no_grad()
     def sample(self, x, n_samples=None):
@@ -356,18 +315,10 @@ class Model(nn.Module):
         residual = self._sample_residual(cond, chan_idx, n_samples)
         residual = residual * self.res_std * scale
 
-        residual = (
-            residual
-            .view(n_samples, batch_size, channels, self.pred_len)
-            .permute(0, 1, 3, 2)
-            .contiguous()
-        )
+        residual = residual.view(n_samples, batch_size, channels, self.pred_len).permute(0, 1, 3, 2).contiguous()
 
         return base.unsqueeze(0) + residual
 
-    # -------------------------------------------------------------------------
-    # Forward
-    # -------------------------------------------------------------------------
     def forward(self, x, target=None, return_loss=False, loss_flag=0):
         if return_loss:
             if target is None:
