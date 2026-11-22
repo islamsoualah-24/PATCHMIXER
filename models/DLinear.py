@@ -25,11 +25,16 @@ class LocalGlobalSeasonal(nn.Module):
         # حساب المسار العالمي
         global_out = self.linear(x)
         
-        # حساب المسار المحلي (يجب إعادة تشكيل الأبعاد لـ Conv1d)
+        # حساب المسار المحلي 
         batch_size, channels, seq_len = x.shape
-        x_local = x.view(batch_size * channels, 1, seq_len) # دمج القنوات مؤقتاً
+        
+        # التعديل هنا: استخدام reshape بدلاً من view
+        x_local = x.reshape(batch_size * channels, 1, seq_len) 
+        
         local_out = self.local_conv(x_local)
-        local_out = local_out.view(batch_size, channels, -1) # إرجاع الأبعاد
+        
+        # التعديل هنا أيضاً: استخدام reshape للإرجاع
+        local_out = local_out.reshape(batch_size, channels, -1) 
         
         # دمج المسارين
         return global_out + local_out
