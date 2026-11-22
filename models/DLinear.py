@@ -1,6 +1,23 @@
 import torch
 import torch.nn as nn
 
+
+# ==========================================
+# مكون جديد: شبكة استخراج الأنماط الموسمية المعقدة
+# ==========================================
+class MLP_Seasonal(nn.Module):
+    def __init__(self, seq_len, pred_len, d_model=128):
+        super(MLP_Seasonal, self).__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(seq_len, d_model),
+            nn.GELU(), # دالة تنشيط غير خطية لالتقاط التغيرات الحادة والقمم
+            nn.Dropout(0.1),
+            nn.Linear(d_model, pred_len)
+        )
+
+    def forward(self, x):
+        return self.mlp(x)
+
 class RevIN(nn.Module):
     def __init__(self, num_features: int, eps=1e-5, affine=True):
         super(RevIN, self).__init__()
@@ -82,54 +99,52 @@ class series_decomp(nn.Module):
 
 
 # ==========================================
-# 3. النموذج الكامل (DLinear + RevIN)
+# 3. النموذج المطور (RevIN + Non-linear Seasonal + Linear Trend)
 # ==========================================
 class Model(nn.Module): 
     def __init__(self, configs): 
         super(Model, self).__init__()
-        # استخراج المتغيرات من configs
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
         enc_in = configs.enc_in
         kernel_size = 25 
         
-        # 1. طبقة التقييس RevIN
+        # 1. طبقة التقييس
         self.revin = RevIN(num_features=enc_in)
         
         # 2. طبقة التفكيك
         self.decomp = series_decomp(kernel_size)
         
-        # 3. الطبقات الخطية للتنبؤ
-        self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
-        self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
+        # 3. طبقات التنبؤ الهجينة (Hybrid Forecasters)
+        # استخدام MLP للموسمية لالتقاط الترددات العالية والقمم المعقدة
+        self.Seasonal_Forecaster = MLP_Seasonal(self.seq_len, self.pred_len, d_model=128)
         
-        # تهيئة أوزان الطبقات الخطية (لضمان استقرار التدريب)
-        self.Linear_Seasonal.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len, self.seq_len]))
-        self.Linear_Trend.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len, self.seq_len]))
+        # استخدام طبقة خطية للاتجاه لالتقاط النمو/الانحدار الرتيب بصلابة
+        self.Trend_Forecaster = nn.Linear(self.seq_len, self.pred_len)
+        
+        # تهيئة أوزان طبقة الاتجاه
+        self.Trend_Forecaster.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len, self.seq_len]))
 
     def forward(self, x):
-        # x shape: [Batch, seq_len, channels]
-        
-        # أ. التقييس (Normalization)
+        # أ. التقييس
         x = self.revin(x, 'norm')
         
-        # ب. التفكيك إلى موسمية واتجاه
+        # ب. التفكيك
         seasonal_init, trend_init = self.decomp(x)
         
-        # ج. تبديل الأبعاد لتمريرها عبر الطبقات الخطية
-        # Shape becomes: [Batch, channels, seq_len]
+        # ج. تبديل الأبعاد: [Batch, channels, seq_len]
         seasonal_init = seasonal_init.permute(0, 2, 1)
         trend_init = trend_init.permute(0, 2, 1)
         
-        # د. التنبؤ
-        seasonal_output = self.Linear_Seasonal(seasonal_init)
-        trend_output = self.Linear_Trend(trend_init)
+        # د. التنبؤ الهجين
+        seasonal_output = self.Seasonal_Forecaster(seasonal_init)
+        trend_output = self.Trend_Forecaster(trend_init)
         
-        # هـ. دمج التنبؤات وإعادة الأبعاد لحالتها الأصلية
+        # هـ. الدمج
         x_pred = seasonal_output + trend_output
-        x_pred = x_pred.permute(0, 2, 1) # Shape becomes: [Batch, pred_len, channels]
+        x_pred = x_pred.permute(0, 2, 1) 
         
-        # و. التقييس العكسي (Denormalization)
+        # و. التقييس العكسي
         x_pred = self.revin(x_pred, 'denorm')
         
         return x_pred
