@@ -108,37 +108,36 @@ class Model(nn.Module):
         self.Linear_Trend.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len, self.seq_len]))
 
     def forward(self, x):
-            # x shape: [Batch, seq_len, channels]
-            
-            # 1. الاحتفاظ بآخر قيمة فعلية لاستخدامها في إعادة البناء
-            last_values = x[:, -1:, :] 
-            
-            # 2. حساب الفروقات (الخطوة الحالية ناقص الخطوة السابقة)
-            # سيصبح الحجم [Batch, seq_len-1, channels]
-            diff_x = x[:, 1:, :] - x[:, :-1, :]
-            
-            # (بما أن الطول نقص بمقدار 1، يجب تعديل الطبقات الخطية في __init__ لتستقبل seq_len - 1)
-            # أو ببساطة يمكننا إضافة صفر في البداية للحفاظ على الطول 512
-            pad = torch.zeros((diff_x.shape[0], 1, diff_x.shape[2])).to(x.device)
-            diff_x = torch.cat([pad, diff_x], dim=1) 
-            
-            # 3. تمرير الفروقات عبر طبقة التقييس والتفكيك (كودك الحالي)
-            diff_x = self.revin(diff_x, 'norm')
-            seasonal_init, trend_init = self.decomp(diff_x)
-            
-            seasonal_init = seasonal_init.permute(0, 2, 1)
-            trend_init = trend_init.permute(0, 2, 1)
-            
-            seasonal_output = self.Linear_Seasonal(seasonal_init)
-            trend_output = self.Linear_Trend(trend_init)
-            
-            diff_pred = seasonal_output + trend_output
-            diff_pred = diff_pred.permute(0, 2, 1)
-            
-            diff_pred = self.revin(diff_pred, 'denorm')
-            
-            # 4. التجميع التراكمي (Cumulative Sum) لاسترجاع القيم المطلقة
-            # نجمع التغيرات المتوقعة ونضيفها إلى آخر قيمة حقيقية
-            x_pred = torch.cumsum(diff_pred, dim=1) + last_values
+        # 1. الاحتفاظ بآخر قيمة فعلية لاستخدامها في إعادة البناء
+        last_values = x[:, -1:, :] 
+        
+        # 2. حساب الفروقات (الخطوة الحالية ناقص الخطوة السابقة)
+        diff_x = x[:, 1:, :] - x[:, :-1, :]
+        
+        # الحفاظ على طول السلسلة (seq_len) بإضافة أصفار في البداية
+        pad = torch.zeros((diff_x.shape[0], 1, diff_x.shape[2])).to(x.device)
+        diff_x = torch.cat([pad, diff_x], dim=1) 
+        
+        # 3. تمرير الفروقات عبر التقييس ثم التفكيك
+        diff_x = self.revin(diff_x, 'norm')
+        seasonal_init, trend_init = self.decomp(diff_x)
+        
+        # تبديل الأبعاد لتناسب الطبقات الخطية
+        seasonal_init = seasonal_init.permute(0, 2, 1)
+        trend_init = trend_init.permute(0, 2, 1)
+        
+        # التنبؤ
+        seasonal_output = self.Linear_Seasonal(seasonal_init)
+        trend_output = self.Linear_Trend(trend_init)
+        
+        # الدمج وإعادة الأبعاد
+        diff_pred = seasonal_output + trend_output
+        diff_pred = diff_pred.permute(0, 2, 1)
+        
+        # التقييس العكسي
+        diff_pred = self.revin(diff_pred, 'denorm')
+        
+        # 4. التجميع التراكمي (Cumulative Sum) لاسترجاع القيم المطلقة
+        x_pred = torch.cumsum(diff_pred, dim=1) + last_values
         
         return x_pred
