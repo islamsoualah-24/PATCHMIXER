@@ -2,22 +2,38 @@ import torch
 import torch.nn as nn
 
 
-# ==========================================
-# مكون جديد: شبكة استخراج الأنماط الموسمية المعقدة
-# ==========================================
-class MLP_Seasonal(nn.Module):
-    def __init__(self, seq_len, pred_len, d_model=128):
-        super(MLP_Seasonal, self).__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(seq_len, d_model),
-            nn.GELU(), # دالة تنشيط غير خطية لالتقاط التغيرات الحادة والقمم
-            nn.Dropout(0.1),
-            nn.Linear(d_model, pred_len)
+class LocalGlobalSeasonal(nn.Module):
+    def __init__(self, seq_len, pred_len):
+        super(LocalGlobalSeasonal, self).__init__()
+        # 1. المسار العالمي (Global): يلتقط النمط الموسمي العام
+        self.linear = nn.Linear(seq_len, pred_len)
+        
+        # 2. المسار المحلي (Local): يلتقط التغيرات الحادة (القمم)
+        # نستخدم Conv1d للحفاظ على التسلسل الزمني واستخراج الميزات المحلية
+        self.local_conv = nn.Sequential(
+            nn.Conv1d(in_channels=1, out_channels=1, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Linear(seq_len, pred_len)
         )
+        
+        # تهيئة الأوزان لضمان استقرار البداية
+        self.linear.weight = nn.Parameter((1/seq_len)*torch.ones([pred_len, seq_len]))
 
     def forward(self, x):
-        return self.mlp(x)
-
+        # x shape: [Batch, channels, seq_len]
+        
+        # حساب المسار العالمي
+        global_out = self.linear(x)
+        
+        # حساب المسار المحلي (يجب إعادة تشكيل الأبعاد لـ Conv1d)
+        batch_size, channels, seq_len = x.shape
+        x_local = x.view(batch_size * channels, 1, seq_len) # دمج القنوات مؤقتاً
+        local_out = self.local_conv(x_local)
+        local_out = local_out.view(batch_size, channels, -1) # إرجاع الأبعاد
+        
+        # دمج المسارين
+        return global_out + local_out
+        
 class RevIN(nn.Module):
     def __init__(self, num_features: int, eps=1e-5, affine=True):
         super(RevIN, self).__init__()
@@ -99,7 +115,7 @@ class series_decomp(nn.Module):
 
 
 # ==========================================
-# 3. النموذج المطور (RevIN + Non-linear Seasonal + Linear Trend)
+# التعديل في النموذج الرئيسي (Model)
 # ==========================================
 class Model(nn.Module): 
     def __init__(self, configs): 
@@ -109,42 +125,27 @@ class Model(nn.Module):
         enc_in = configs.enc_in
         kernel_size = 25 
         
-        # 1. طبقة التقييس
         self.revin = RevIN(num_features=enc_in)
-        
-        # 2. طبقة التفكيك
         self.decomp = series_decomp(kernel_size)
         
-        # 3. طبقات التنبؤ الهجينة (Hybrid Forecasters)
-        # استخدام MLP للموسمية لالتقاط الترددات العالية والقمم المعقدة
-        self.Seasonal_Forecaster = MLP_Seasonal(self.seq_len, self.pred_len, d_model=128)
+        # استخدام المكون الجديد الهجين للموسمية
+        self.Seasonal_Forecaster = LocalGlobalSeasonal(self.seq_len, self.pred_len)
         
-        # استخدام طبقة خطية للاتجاه لالتقاط النمو/الانحدار الرتيب بصلابة
         self.Trend_Forecaster = nn.Linear(self.seq_len, self.pred_len)
-        
-        # تهيئة أوزان طبقة الاتجاه
         self.Trend_Forecaster.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len, self.seq_len]))
 
     def forward(self, x):
-        # أ. التقييس
         x = self.revin(x, 'norm')
-        
-        # ب. التفكيك
         seasonal_init, trend_init = self.decomp(x)
         
-        # ج. تبديل الأبعاد: [Batch, channels, seq_len]
         seasonal_init = seasonal_init.permute(0, 2, 1)
         trend_init = trend_init.permute(0, 2, 1)
         
-        # د. التنبؤ الهجين
         seasonal_output = self.Seasonal_Forecaster(seasonal_init)
         trend_output = self.Trend_Forecaster(trend_init)
         
-        # هـ. الدمج
         x_pred = seasonal_output + trend_output
         x_pred = x_pred.permute(0, 2, 1) 
         
-        # و. التقييس العكسي
         x_pred = self.revin(x_pred, 'denorm')
-        
         return x_pred
