@@ -2,41 +2,33 @@ import torch
 import torch.nn as nn
 
 
-class AttentionalSeasonal(nn.Module):
+# ==========================================
+# 1. مكون خلط القنوات (Channel Mixer)
+# ==========================================
+class ChannelMixer(nn.Module):
     """
-    مكون موسمي يعتمد على آلية الانتباه الذاتي لالتقاط التموجات المعقدة والقمم.
+    تطبيق شبكة MLP على بُعد القنوات (Channels) لالتقاط العلاقات بين المتغيرات المتعددة
     """
-    def __init__(self, seq_len, pred_len, channels, num_heads=4):
-        super(AttentionalSeasonal, self).__init__()
-        # طبقة الانتباه الذاتي متعدد الرؤوس (تعمل عبر القنوات)
-        self.self_attention = nn.MultiheadAttention(embed_dim=channels, num_heads=num_heads, batch_first=True)
-        
-        # طبقة تسوية (Normalization) لضمان استقرار التدريب
+    def __init__(self, channels, dropout=0.1):
+        super(ChannelMixer, self).__init__()
+        # توسيع وتقليص الأبعاد لتعلم تمثيلات أعمق
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, channels * 2),
+            nn.GELU(), # تنشيط غير خطي لالتقاط الأنماط المعقدة
+            nn.Dropout(dropout),
+            nn.Linear(channels * 2, channels),
+            nn.Dropout(dropout)
+        )
+        # تقييس الطبقة لتحقيق استقرار أثناء التدريب
         self.norm = nn.LayerNorm(channels)
-        
-        # طبقة خطية نهائية لتحويل طول السلسلة المدخلة إلى طول التنبؤ المطلوب
-        self.linear_projection = nn.Linear(seq_len, pred_len)
 
     def forward(self, x):
-        # x shape: [Batch, Seq_len, Channels]
-        
-        # 1. تطبيق الانتباه الذاتي
-        attn_out, _ = self.self_attention(query=x, key=x, value=x)
-        
-        # 2. اتصال متبقي (Residual Connection) + تسوية
-        x = self.norm(x + attn_out)
-        
-        # 3. تبديل الأبعاد لتطبيق التحويل الخطي على المحور الزمني
-        # Shape becomes: [Batch, Channels, Seq_len]
-        x = x.permute(0, 2, 1)
-        
-        # 4. التنبؤ الخطي للطول المستهدف
-        # Shape becomes: [Batch, Channels, Pred_len]
-        x = self.linear_projection(x)
-        
-        # إعادة الأبعاد لحالتها الأصلية: [Batch, Pred_len, Channels]
-        return x.permute(0, 2, 1)
-
+        # الإدخال x: [Batch, pred_len, Channels]
+        res = x
+        x = self.norm(x)
+        x = self.mlp(x)
+        # اتصال متبقي (Residual Connection) لمنع تلاشي التدرجات
+        return x + res
 class RevIN(nn.Module):
     def __init__(self, num_features: int, eps=1e-5, affine=True):
         super(RevIN, self).__init__()
@@ -120,49 +112,51 @@ class series_decomp(nn.Module):
 # ==========================================
 # 3. النموذج الكامل (DLinear + RevIN)
 # ==========================================
-class Model(nn.Module):
-    """
-    النموذج الهجين: الانتباه الذاتي للموسمية + خطي للاتجاه
-    """
-    def __init__(self, configs):
+# ==========================================
+# 2. النموذج الكامل المدمج (DLinear + RevIN + Channel Mixer)
+# ==========================================
+class Model(nn.Module): 
+    def __init__(self, configs): 
         super(Model, self).__init__()
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
-        self.channels = configs.enc_in
+        enc_in = configs.enc_in # عدد القنوات/المتغيرات
         kernel_size = 25 
         
-        # التقييس والتفكيك
-        self.revin = RevIN(num_features=self.channels)
+        self.revin = RevIN(num_features=enc_in)
         self.decomp = series_decomp(kernel_size)
         
-        # استخدام المكون الجديد المبني على الانتباه للموسمية
-        # يجب أن يكون عدد القنوات (channels) قابلاً للقسمة على num_heads
-        # إذا كان enc_in مثلاً 7، يمكنك استخدام num_heads=1 أو تعديل الأبعاد
-        self.Seasonal_Block = AttentionalSeasonal(self.seq_len, self.pred_len, self.channels, num_heads=1)
-        
-        # إبقاء الاتجاه خطياً
+        # أ. مكون الخلط الزمني (Temporal Mixing - DLinear الأساسي)
+        self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
         self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
-        self.Linear_Trend.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len, self.seq_len]))
+        
+        # ب. مكون خلط القنوات (Channel Mixing - الإضافة الجديدة)
+        self.Seasonal_Channel_Mixer = ChannelMixer(enc_in, dropout=configs.dropout)
+        self.Trend_Channel_Mixer = ChannelMixer(enc_in, dropout=configs.dropout)
 
     def forward(self, x):
         # x shape: [Batch, seq_len, channels]
         x = self.revin(x, 'norm')
         
-        # التفكيك
         seasonal_init, trend_init = self.decomp(x)
         
-        # المكون الموسمي (الانتباه الذاتي يعمل مباشرة على [Batch, seq_len, channels])
-        seasonal_output = self.Seasonal_Block(seasonal_init)
+        # تبديل الأبعاد لتطبيق الخلط الزمني
+        seasonal_init = seasonal_init.permute(0, 2, 1) # [Batch, channels, seq_len]
+        trend_init = trend_init.permute(0, 2, 1)       # [Batch, channels, seq_len]
         
-        # المكون الاتجاهي (نحتاج لتبديل الأبعاد لتطبيق الطبقة الخطية على الزمن)
-        trend_init = trend_init.permute(0, 2, 1)
-        trend_output = self.Linear_Trend(trend_init)
-        trend_output = trend_output.permute(0, 2, 1)
+        # 1. تطبيق الخلط الزمني
+        seasonal_output = self.Linear_Seasonal(seasonal_init) # [Batch, channels, pred_len]
+        trend_output = self.Linear_Trend(trend_init)          # [Batch, channels, pred_len]
         
-        # دمج التنبؤات
+        # إعادة الأبعاد لتطبيق خلط القنوات
+        seasonal_output = seasonal_output.permute(0, 2, 1) # [Batch, pred_len, channels]
+        trend_output = trend_output.permute(0, 2, 1)       # [Batch, pred_len, channels]
+        
+        # 2. تطبيق خلط القنوات
+        seasonal_output = self.Seasonal_Channel_Mixer(seasonal_output)
+        trend_output = self.Trend_Channel_Mixer(trend_output)
+        
         x_pred = seasonal_output + trend_output
         
-        # التقييس العكسي
         x_pred = self.revin(x_pred, 'denorm')
-        
         return x_pred
