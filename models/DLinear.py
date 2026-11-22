@@ -67,29 +67,20 @@ class moving_avg(nn.Module):
         x = x.permute(0, 2, 1)
         return x
 
-# المكون الجديد: التفكيك متعدد المقاييس
-class multi_scale_series_decomp(nn.Module):
+class series_decomp(nn.Module):
     """
-    Multi-scale Series Decomposition Block
+    تفكيك السلسلة الزمنية إلى: موسمية (Seasonal) واتجاه (Trend)
     """
-    def __init__(self, kernel_sizes=[7, 15, 25, 41]):
-        super(multi_scale_series_decomp, self).__init__()
-        # إنشاء قائمة من النوافذ المتحركة بأحجام مختلفة
-        self.moving_avgs = nn.ModuleList([
-            moving_avg(kernel, stride=1) for kernel in kernel_sizes
-        ])
+    def __init__(self, kernel_size):
+        super(series_decomp, self).__init__()
+        self.moving_avg = moving_avg(kernel_size, stride=1)
 
     def forward(self, x):
-        moving_means = []
-        for m_avg in self.moving_avgs:
-            moving_means.append(m_avg(x))
-        
-        # دمج الاتجاهات (هنا نستخدم المتوسط، ويمكن مستقبلاً استخدام أوزان قابلة للتعلم)
-        trend = sum(moving_means) / len(moving_means)
-        
-        # حساب الجزء الموسمي (الباقي)
-        res = x - trend
-        return res, trend
+        moving_mean = self.moving_avg(x)
+        res = x - moving_mean
+        return res, moving_mean
+
+
 # ==========================================
 # 3. النموذج الكامل (DLinear + RevIN)
 # ==========================================
@@ -106,8 +97,7 @@ class Model(nn.Module):
         self.revin = RevIN(num_features=enc_in)
         
         # 2. طبقة التفكيك
-        #self.decomp = series_decomp(kernel_size)
-        self.decomp = multi_scale_series_decomp(kernel_sizes=[7, 15, 25, 41])
+        self.decomp = series_decomp(kernel_size)
         
         # 3. الطبقات الخطية للتنبؤ
         self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
