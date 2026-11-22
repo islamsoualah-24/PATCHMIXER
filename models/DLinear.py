@@ -106,7 +106,8 @@ class Model(nn.Module):
         self.revin = RevIN(num_features=enc_in)
         
         # 2. طبقة التفكيك
-        self.decomp = series_decomp(kernel_size)
+        #self.decomp = series_decomp(kernel_size)
+        self.decomp = multi_scale_series_decomp(kernel_sizes=[7, 15, 25, 41])
         
         # 3. الطبقات الخطية للتنبؤ
         self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
