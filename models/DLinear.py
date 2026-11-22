@@ -1,25 +1,41 @@
 import torch
 import torch.nn as nn
 
-# ==========================================
-# 1. طبقة الـ Patching
-# ==========================================
-class Patching(nn.Module):
+
+class AttentionalSeasonal(nn.Module):
     """
-    تقسيم السلسلة الزمنية إلى أجزاء (Patches).
-    باستخدام stride أقل من patch_len نحصل على تقطيع متداخل (Overlapping).
+    مكون موسمي يعتمد على آلية الانتباه الذاتي لالتقاط التموجات المعقدة والقمم.
     """
-    def __init__(self, patch_len, stride):
-        super(Patching, self).__init__()
-        self.patch_len = patch_len
-        self.stride = stride
+    def __init__(self, seq_len, pred_len, channels, num_heads=4):
+        super(AttentionalSeasonal, self).__init__()
+        # طبقة الانتباه الذاتي متعدد الرؤوس (تعمل عبر القنوات)
+        self.self_attention = nn.MultiheadAttention(embed_dim=channels, num_heads=num_heads, batch_first=True)
+        
+        # طبقة تسوية (Normalization) لضمان استقرار التدريب
+        self.norm = nn.LayerNorm(channels)
+        
+        # طبقة خطية نهائية لتحويل طول السلسلة المدخلة إلى طول التنبؤ المطلوب
+        self.linear_projection = nn.Linear(seq_len, pred_len)
 
     def forward(self, x):
-        # x shape: [Batch, Channels, Seq_len]
-        # استخدام دالة unfold لاستخراج الأجزاء بفعالية
-        # Output shape: [Batch, Channels, Num_patches, patch_len]
-        x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
-        return x
+        # x shape: [Batch, Seq_len, Channels]
+        
+        # 1. تطبيق الانتباه الذاتي
+        attn_out, _ = self.self_attention(query=x, key=x, value=x)
+        
+        # 2. اتصال متبقي (Residual Connection) + تسوية
+        x = self.norm(x + attn_out)
+        
+        # 3. تبديل الأبعاد لتطبيق التحويل الخطي على المحور الزمني
+        # Shape becomes: [Batch, Channels, Seq_len]
+        x = x.permute(0, 2, 1)
+        
+        # 4. التنبؤ الخطي للطول المستهدف
+        # Shape becomes: [Batch, Channels, Pred_len]
+        x = self.linear_projection(x)
+        
+        # إعادة الأبعاد لحالتها الأصلية: [Batch, Pred_len, Channels]
+        return x.permute(0, 2, 1)
 
 class RevIN(nn.Module):
     def __init__(self, num_features: int, eps=1e-5, affine=True):
@@ -102,39 +118,31 @@ class series_decomp(nn.Module):
 
 
 # ==========================================
-# 2. النموذج الكامل المقترح: Patch-DLinear
+# 3. النموذج الكامل (DLinear + RevIN)
 # ==========================================
-
 class Model(nn.Module):
+    """
+    النموذج الهجين: الانتباه الذاتي للموسمية + خطي للاتجاه
+    """
     def __init__(self, configs):
         super(Model, self).__init__()
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
-        
-        # إعدادات الـ Patching (يمكنك إضافتها في ملف configs)
-        self.patch_len = getattr(configs, 'patch_len', 16) # طول الجزء
-        self.stride = getattr(configs, 'stride', 8)        # مقدار الانزياح (8 يعني تداخل بنسبة 50%)
-        
-        enc_in = configs.enc_in
+        self.channels = configs.enc_in
         kernel_size = 25 
         
-        self.revin = RevIN(num_features=enc_in)
+        # التقييس والتفكيك
+        self.revin = RevIN(num_features=self.channels)
         self.decomp = series_decomp(kernel_size)
-        self.patching = Patching(self.patch_len, self.stride)
         
-        # حساب عدد الـ Patches بناءً على طول السلسلة
-        self.num_patches = int((self.seq_len - self.patch_len) / self.stride) + 1
+        # استخدام المكون الجديد المبني على الانتباه للموسمية
+        # يجب أن يكون عدد القنوات (channels) قابلاً للقسمة على num_heads
+        # إذا كان enc_in مثلاً 7، يمكنك استخدام num_heads=1 أو تعديل الأبعاد
+        self.Seasonal_Block = AttentionalSeasonal(self.seq_len, self.pred_len, self.channels, num_heads=1)
         
-        # البعد الجديد بعد التقطيع والدمج
-        self.patch_dim = self.num_patches * self.patch_len
-        
-        # الطبقات الخطية الآن تأخذ البعد الجديد (الذي يحتوي على الأنماط المحلية المتداخلة)
-        self.Linear_Seasonal = nn.Linear(self.patch_dim, self.pred_len)
-        self.Linear_Trend = nn.Linear(self.patch_dim, self.pred_len)
-        
-        # تهيئة الأوزان
-        self.Linear_Seasonal.weight = nn.Parameter((1/self.patch_dim)*torch.ones([self.pred_len, self.patch_dim]))
-        self.Linear_Trend.weight = nn.Parameter((1/self.patch_dim)*torch.ones([self.pred_len, self.patch_dim]))
+        # إبقاء الاتجاه خطياً
+        self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
+        self.Linear_Trend.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len, self.seq_len]))
 
     def forward(self, x):
         # x shape: [Batch, seq_len, channels]
@@ -143,28 +151,16 @@ class Model(nn.Module):
         # التفكيك
         seasonal_init, trend_init = self.decomp(x)
         
-        # تبديل الأبعاد لتجهيزها للتقطيع (التقطيع يتم على المحور الزمني)
-        # Shape: [Batch, channels, seq_len]
-        seasonal_init = seasonal_init.permute(0, 2, 1)
+        # المكون الموسمي (الانتباه الذاتي يعمل مباشرة على [Batch, seq_len, channels])
+        seasonal_output = self.Seasonal_Block(seasonal_init)
+        
+        # المكون الاتجاهي (نحتاج لتبديل الأبعاد لتطبيق الطبقة الخطية على الزمن)
         trend_init = trend_init.permute(0, 2, 1)
+        trend_output = self.Linear_Trend(trend_init)
+        trend_output = trend_output.permute(0, 2, 1)
         
-        # تطبيق التقطيع (Patching)
-        # Shape becomes: [Batch, channels, num_patches, patch_len]
-        seasonal_patches = self.patching(seasonal_init)
-        trend_patches = self.patching(trend_init)
-        
-        # تسطيح الأجزاء لتمريرها للطبقة الخطية مع الحفاظ على استقلالية القنوات
-        # Shape becomes: [Batch, channels, num_patches * patch_len]
-        seasonal_flat = seasonal_patches.reshape(seasonal_patches.size(0), seasonal_patches.size(1), -1)
-        trend_flat = trend_patches.reshape(trend_patches.size(0), trend_patches.size(1), -1)
-        
-        # التنبؤ الخطي
-        seasonal_output = self.Linear_Seasonal(seasonal_flat)
-        trend_output = self.Linear_Trend(trend_flat)
-        
-        # دمج التنبؤات وإعادة الأبعاد
+        # دمج التنبؤات
         x_pred = seasonal_output + trend_output
-        x_pred = x_pred.permute(0, 2, 1) # Shape: [Batch, pred_len, channels]
         
         # التقييس العكسي
         x_pred = self.revin(x_pred, 'denorm')
