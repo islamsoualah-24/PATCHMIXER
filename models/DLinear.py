@@ -108,28 +108,37 @@ class Model(nn.Module):
         self.Linear_Trend.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len, self.seq_len]))
 
     def forward(self, x):
-        # x shape: [Batch, seq_len, channels]
-        
-        # أ. التقييس (Normalization)
-        x = self.revin(x, 'norm')
-        
-        # ب. التفكيك إلى موسمية واتجاه
-        seasonal_init, trend_init = self.decomp(x)
-        
-        # ج. تبديل الأبعاد لتمريرها عبر الطبقات الخطية
-        # Shape becomes: [Batch, channels, seq_len]
-        seasonal_init = seasonal_init.permute(0, 2, 1)
-        trend_init = trend_init.permute(0, 2, 1)
-        
-        # د. التنبؤ
-        seasonal_output = self.Linear_Seasonal(seasonal_init)
-        trend_output = self.Linear_Trend(trend_init)
-        
-        # هـ. دمج التنبؤات وإعادة الأبعاد لحالتها الأصلية
-        x_pred = seasonal_output + trend_output
-        x_pred = x_pred.permute(0, 2, 1) # Shape becomes: [Batch, pred_len, channels]
-        
-        # و. التقييس العكسي (Denormalization)
-        x_pred = self.revin(x_pred, 'denorm')
+            # x shape: [Batch, seq_len, channels]
+            
+            # 1. الاحتفاظ بآخر قيمة فعلية لاستخدامها في إعادة البناء
+            last_values = x[:, -1:, :] 
+            
+            # 2. حساب الفروقات (الخطوة الحالية ناقص الخطوة السابقة)
+            # سيصبح الحجم [Batch, seq_len-1, channels]
+            diff_x = x[:, 1:, :] - x[:, :-1, :]
+            
+            # (بما أن الطول نقص بمقدار 1، يجب تعديل الطبقات الخطية في __init__ لتستقبل seq_len - 1)
+            # أو ببساطة يمكننا إضافة صفر في البداية للحفاظ على الطول 512
+            pad = torch.zeros((diff_x.shape[0], 1, diff_x.shape[2])).to(x.device)
+            diff_x = torch.cat([pad, diff_x], dim=1) 
+            
+            # 3. تمرير الفروقات عبر طبقة التقييس والتفكيك (كودك الحالي)
+            diff_x = self.revin(diff_x, 'norm')
+            seasonal_init, trend_init = self.decomp(diff_x)
+            
+            seasonal_init = seasonal_init.permute(0, 2, 1)
+            trend_init = trend_init.permute(0, 2, 1)
+            
+            seasonal_output = self.Linear_Seasonal(seasonal_init)
+            trend_output = self.Linear_Trend(trend_init)
+            
+            diff_pred = seasonal_output + trend_output
+            diff_pred = diff_pred.permute(0, 2, 1)
+            
+            diff_pred = self.revin(diff_pred, 'denorm')
+            
+            # 4. التجميع التراكمي (Cumulative Sum) لاسترجاع القيم المطلقة
+            # نجمع التغيرات المتوقعة ونضيفها إلى آخر قيمة حقيقية
+            x_pred = torch.cumsum(diff_pred, dim=1) + last_values
         
         return x_pred
