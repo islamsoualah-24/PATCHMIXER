@@ -1,44 +1,6 @@
 import torch
 import torch.nn as nn
 
-
-class LocalGlobalSeasonal(nn.Module):
-    def __init__(self, seq_len, pred_len):
-        super(LocalGlobalSeasonal, self).__init__()
-        # 1. المسار العالمي (Global): يلتقط النمط الموسمي العام
-        self.linear = nn.Linear(seq_len, pred_len)
-        
-        # 2. المسار المحلي (Local): يلتقط التغيرات الحادة (القمم)
-        # نستخدم Conv1d للحفاظ على التسلسل الزمني واستخراج الميزات المحلية
-        self.local_conv = nn.Sequential(
-            nn.Conv1d(in_channels=1, out_channels=1, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Linear(seq_len, pred_len)
-        )
-        
-        # تهيئة الأوزان لضمان استقرار البداية
-        self.linear.weight = nn.Parameter((1/seq_len)*torch.ones([pred_len, seq_len]))
-
-    def forward(self, x):
-        # x shape: [Batch, channels, seq_len]
-        
-        # حساب المسار العالمي
-        global_out = self.linear(x)
-        
-        # حساب المسار المحلي 
-        batch_size, channels, seq_len = x.shape
-        
-        # التعديل هنا: استخدام reshape بدلاً من view
-        x_local = x.reshape(batch_size * channels, 1, seq_len) 
-        
-        local_out = self.local_conv(x_local)
-        
-        # التعديل هنا أيضاً: استخدام reshape للإرجاع
-        local_out = local_out.reshape(batch_size, channels, -1) 
-        
-        # دمج المسارين
-        return global_out + local_out
-        
 class RevIN(nn.Module):
     def __init__(self, num_features: int, eps=1e-5, affine=True):
         super(RevIN, self).__init__()
@@ -120,37 +82,54 @@ class series_decomp(nn.Module):
 
 
 # ==========================================
-# التعديل في النموذج الرئيسي (Model)
+# 3. النموذج الكامل (DLinear + RevIN)
 # ==========================================
 class Model(nn.Module): 
     def __init__(self, configs): 
         super(Model, self).__init__()
+        # استخراج المتغيرات من configs
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
         enc_in = configs.enc_in
         kernel_size = 25 
         
+        # 1. طبقة التقييس RevIN
         self.revin = RevIN(num_features=enc_in)
+        
+        # 2. طبقة التفكيك
         self.decomp = series_decomp(kernel_size)
         
-        # استخدام المكون الجديد الهجين للموسمية
-        self.Seasonal_Forecaster = LocalGlobalSeasonal(self.seq_len, self.pred_len)
+        # 3. الطبقات الخطية للتنبؤ
+        self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
+        self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
         
-        self.Trend_Forecaster = nn.Linear(self.seq_len, self.pred_len)
-        self.Trend_Forecaster.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len, self.seq_len]))
+        # تهيئة أوزان الطبقات الخطية (لضمان استقرار التدريب)
+        self.Linear_Seasonal.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len, self.seq_len]))
+        self.Linear_Trend.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len, self.seq_len]))
 
     def forward(self, x):
+        # x shape: [Batch, seq_len, channels]
+        
+        # أ. التقييس (Normalization)
         x = self.revin(x, 'norm')
+        
+        # ب. التفكيك إلى موسمية واتجاه
         seasonal_init, trend_init = self.decomp(x)
         
+        # ج. تبديل الأبعاد لتمريرها عبر الطبقات الخطية
+        # Shape becomes: [Batch, channels, seq_len]
         seasonal_init = seasonal_init.permute(0, 2, 1)
         trend_init = trend_init.permute(0, 2, 1)
         
-        seasonal_output = self.Seasonal_Forecaster(seasonal_init)
-        trend_output = self.Trend_Forecaster(trend_init)
+        # د. التنبؤ
+        seasonal_output = self.Linear_Seasonal(seasonal_init)
+        trend_output = self.Linear_Trend(trend_init)
         
+        # هـ. دمج التنبؤات وإعادة الأبعاد لحالتها الأصلية
         x_pred = seasonal_output + trend_output
-        x_pred = x_pred.permute(0, 2, 1) 
+        x_pred = x_pred.permute(0, 2, 1) # Shape becomes: [Batch, pred_len, channels]
         
+        # و. التقييس العكسي (Denormalization)
         x_pred = self.revin(x_pred, 'denorm')
+        
         return x_pred
