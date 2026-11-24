@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.fft # ضروري لتحويلات فورييه
 
 # ==========================================
-# 1. مكون التردد الصحيح (Complex Frequency Upsampling)
+# 1. مكون التردد مع فلتر التمرير المنخفض (Low-Pass Filter)
 # ==========================================
 class ComplexFreqLinear(nn.Module):
     def __init__(self, seq_len, pred_len, enc_in, individual=False, cut_freq=25):
@@ -14,9 +14,11 @@ class ComplexFreqLinear(nn.Module):
         self.individual = individual
         self.channels = enc_in
         
-        # تطبيق Low-Pass Filter: الاحتفاظ فقط بأول cut_freq تردد وحذف الضوضاء العالية
+        # تحديد الترددات الأساسية فقط وتجاهل الضوضاء العالية
         self.dominance_freq = min(cut_freq, seq_len // 2 + 1)
         self.length_ratio = self.total_len / self.seq_len
+        
+        # حساب البعد الترددي بعد التوسيع
         self.out_dominance_freq = int(self.dominance_freq * self.length_ratio)
 
         if self.individual:
@@ -33,10 +35,10 @@ class ComplexFreqLinear(nn.Module):
     def forward(self, x):
         # x shape: [Batch, channels, seq_len]
         
-        # 1. تحويل فورييه السريع واقتطاع الترددات العالية (Low-Pass Filtering)
+        # 1. تحويل فورييه السريع + اقتطاع الترددات العالية (فلترة الضوضاء)
         low_specx = torch.fft.rfft(x, dim=-1)[:, :, :self.dominance_freq]
         
-        # 2. الإسقاط الخطي المركب لتوسيع الطيف الترددي
+        # 2. الإسقاط الخطي المركب (يوسع الطيف الترددي مع الحفاظ على الطور)
         if self.individual:
             low_specxy_ = torch.zeros(
                 [low_specx.size(0), self.channels, self.out_dominance_freq],
@@ -53,17 +55,19 @@ class ComplexFreqLinear(nn.Module):
             [low_specxy_.size(0), low_specxy_.size(1), out_freq_dim],
             dtype=low_specxy_.dtype, device=low_specxy_.device
         )
+        
+        # نسخ الترددات المتعلمة إلى بداية الطيف
         min_len = min(low_specxy_.size(-1), out_freq_dim)
         low_specxy[:, :, :min_len] = low_specxy_[:, :, :min_len]
 
-        # 4. التحويل العكسي وضرب الإشارة في معامل التصحيح للحفاظ على الطاقة
+        # 4. التحويل العكسي للعودة إلى المجال الزمني والضرب في معامل التصحيح للحفاظ على الطاقة
         low_xy = torch.fft.irfft(low_specxy, n=self.total_len, dim=-1)
         low_xy = low_xy * self.length_ratio
         
-        # 5. استخراج الجزء الخاص بالتنبؤ فقط (آخر pred_len خطوة)
+        # 5. استخراج الجزء الخاص بالمستقبل فقط (آخر pred_len خطوة)
         pred_seasonal = low_xy[:, :, -self.pred_len:]
         return pred_seasonal
-# ==========================================
+        # ==========================================
 # 1. طبقة التقييس (RevIN)
 # ==========================================
 class RevIN(nn.Module):
@@ -173,7 +177,7 @@ class FreqLinear(nn.Module):
         return out
 
 # ==========================================
-# 2. النموذج المدمج (Complex-Freq DLinear + RevIN)
+# 2. استدعاء الكلاس داخل Model
 # ==========================================
 class Model(nn.Module): 
     def __init__(self, configs): 
@@ -182,6 +186,9 @@ class Model(nn.Module):
         self.pred_len = configs.pred_len
         self.enc_in = configs.enc_in
         self.individual = getattr(configs, 'individual', False)
+        
+        # يمكنك تمرير cut_freq من configs أو تثبيته هنا (مثلاً 25 أو 50)
+        cut_freq = getattr(configs, 'cut_freq', 25) 
         kernel_size = 25 
         
         self.revin = RevIN(num_features=self.enc_in)
@@ -191,8 +198,10 @@ class Model(nn.Module):
         self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
         self.Linear_Trend.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len, self.seq_len]))
         
-        # الموسمية في المجال الترددي المركب
-        self.Freq_Seasonal = ComplexFreqLinear(self.seq_len, self.pred_len, self.enc_in, self.individual)
+        # الموسمية في المجال الترددي المركب مع الفلتر
+        self.Freq_Seasonal = ComplexFreqLinear(
+            self.seq_len, self.pred_len, self.enc_in, self.individual, cut_freq=cut_freq
+        )
 
     def forward(self, x):
         # x: [Batch, seq_len, channels]
