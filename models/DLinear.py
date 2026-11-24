@@ -3,10 +3,10 @@ import torch.nn as nn
 import torch.fft # ضروري لتحويلات فورييه
 
 # ==========================================
-# 1. مكون التردد مع فلتر التمرير المنخفض (Low-Pass Filter)
+# 1. مكون التردد الكامل (بدون اقتطاع)
 # ==========================================
 class ComplexFreqLinear(nn.Module):
-    def __init__(self, seq_len, pred_len, enc_in, individual=False, cut_freq=25):
+    def __init__(self, seq_len, pred_len, enc_in, individual=False):
         super(ComplexFreqLinear, self).__init__()
         self.seq_len = seq_len
         self.pred_len = pred_len
@@ -14,11 +14,9 @@ class ComplexFreqLinear(nn.Module):
         self.individual = individual
         self.channels = enc_in
         
-        # تحديد الترددات الأساسية فقط وتجاهل الضوضاء العالية
-        self.dominance_freq = min(cut_freq, seq_len // 2 + 1)
+        # الاحتفاظ بكامل الطيف الترددي الذي أعطى النتائج الممتازة سابقاً
+        self.dominance_freq = seq_len // 2 + 1
         self.length_ratio = self.total_len / self.seq_len
-        
-        # حساب البعد الترددي بعد التوسيع
         self.out_dominance_freq = int(self.dominance_freq * self.length_ratio)
 
         if self.individual:
@@ -33,12 +31,8 @@ class ComplexFreqLinear(nn.Module):
             ).to(torch.cfloat)
 
     def forward(self, x):
-        # x shape: [Batch, channels, seq_len]
+        low_specx = torch.fft.rfft(x, dim=-1)
         
-        # 1. تحويل فورييه السريع + اقتطاع الترددات العالية (فلترة الضوضاء)
-        low_specx = torch.fft.rfft(x, dim=-1)[:, :, :self.dominance_freq]
-        
-        # 2. الإسقاط الخطي المركب (يوسع الطيف الترددي مع الحفاظ على الطور)
         if self.individual:
             low_specxy_ = torch.zeros(
                 [low_specx.size(0), self.channels, self.out_dominance_freq],
@@ -49,25 +43,19 @@ class ComplexFreqLinear(nn.Module):
         else:
             low_specxy_ = self.freq_upsampler(low_specx)
 
-        # 3. حشو باقي الطيف بالأصفار (Zero-Padding) ليطابق الطول الكلي (seq_len + pred_len)
         out_freq_dim = self.total_len // 2 + 1
         low_specxy = torch.zeros(
             [low_specxy_.size(0), low_specxy_.size(1), out_freq_dim],
             dtype=low_specxy_.dtype, device=low_specxy_.device
         )
-        
-        # نسخ الترددات المتعلمة إلى بداية الطيف
         min_len = min(low_specxy_.size(-1), out_freq_dim)
         low_specxy[:, :, :min_len] = low_specxy_[:, :, :min_len]
 
-        # 4. التحويل العكسي للعودة إلى المجال الزمني والضرب في معامل التصحيح للحفاظ على الطاقة
         low_xy = torch.fft.irfft(low_specxy, n=self.total_len, dim=-1)
         low_xy = low_xy * self.length_ratio
         
-        # 5. استخراج الجزء الخاص بالمستقبل فقط (آخر pred_len خطوة)
-        pred_seasonal = low_xy[:, :, -self.pred_len:]
-        return pred_seasonal
-        # ==========================================
+        return low_xy[:, :, -self.pred_len:]
+# ==========================================
 # 1. طبقة التقييس (RevIN)
 # ==========================================
 class RevIN(nn.Module):
@@ -175,9 +163,8 @@ class FreqLinear(nn.Module):
         # 5. التحويل العكسي للعودة إلى المجال الزمني بطول pred_len
         out = torch.fft.irfft(out_fft, n=self.pred_len, dim=-1)
         return out
-
 # ==========================================
-# 2. استدعاء الكلاس داخل Model
+# 2. النموذج الهجين ثنائي المجال (Time-Frequency Dual-Domain DLinear)
 # ==========================================
 class Model(nn.Module): 
     def __init__(self, configs): 
@@ -186,33 +173,44 @@ class Model(nn.Module):
         self.pred_len = configs.pred_len
         self.enc_in = configs.enc_in
         self.individual = getattr(configs, 'individual', False)
-        
-        # يمكنك تمرير cut_freq من configs أو تثبيته هنا (مثلاً 25 أو 50)
-        cut_freq = getattr(configs, 'cut_freq', 25) 
         kernel_size = 25 
         
         self.revin = RevIN(num_features=self.enc_in)
         self.decomp = series_decomp(kernel_size)
         
-        # الاتجاه في المجال الزمني
+        # 1. فرع الاتجاه (Trend) - زمني
         self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
         self.Linear_Trend.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len, self.seq_len]))
         
-        # الموسمية في المجال الترددي المركب مع الفلتر
-        self.Freq_Seasonal = ComplexFreqLinear(
-            self.seq_len, self.pred_len, self.enc_in, self.individual, cut_freq=cut_freq
-        )
+        # 2. فرع الموسمية الزمني (Time-Domain Seasonal)
+        self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
+        self.Linear_Seasonal.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len, self.seq_len]))
+        
+        # 3. فرع الموسمية الترددي (Frequency-Domain Seasonal)
+        self.Freq_Seasonal = ComplexFreqLinear(self.seq_len, self.pred_len, self.enc_in, self.individual)
+        
+        # 4. بوابة دمج تكيفية لكل قناة (Learnable Fusion Gate)
+        # تتعلم تلقائياً الوزن الأمثل بين المجال الزمني والترددي لكل متغير
+        self.alpha = nn.Parameter(torch.zeros(1, self.enc_in, 1))
 
     def forward(self, x):
         # x: [Batch, seq_len, channels]
         x = self.revin(x, 'norm')
         
         seasonal_init, trend_init = self.decomp(x)
-        seasonal_init = seasonal_init.permute(0, 2, 1)
-        trend_init = trend_init.permute(0, 2, 1)
+        seasonal_init = seasonal_init.permute(0, 2, 1) # [Batch, channels, seq_len]
+        trend_init = trend_init.permute(0, 2, 1)       # [Batch, channels, seq_len]
         
+        # التنبؤ بالاتجاه
         trend_output = self.Linear_Trend(trend_init)
-        seasonal_output = self.Freq_Seasonal(seasonal_init)
+        
+        # التنبؤ بالموسمية في المجالين معاً
+        time_seasonal = self.Linear_Seasonal(seasonal_init)
+        freq_seasonal = self.Freq_Seasonal(seasonal_init)
+        
+        # دمج تكيفي عبر Sigmoid لضمان بقاء الوزن بين 0 و 1
+        gate = torch.sigmoid(self.alpha)
+        seasonal_output = gate * freq_seasonal + (1 - gate) * time_seasonal
         
         x_pred = (seasonal_output + trend_output).permute(0, 2, 1)
         x_pred = self.revin(x_pred, 'denorm')
