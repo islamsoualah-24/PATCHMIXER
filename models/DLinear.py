@@ -178,19 +178,18 @@ class Model(nn.Module):
         self.revin = RevIN(num_features=self.enc_in)
         self.decomp = series_decomp(kernel_size)
         
-        # 1. فرع الاتجاه (Trend) - زمني
+        # 1. الاتجاه (المجال الزمني)
         self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
         self.Linear_Trend.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len, self.seq_len]))
         
-        # 2. فرع الموسمية الزمني (Time-Domain Seasonal)
+        # 2. الموسمية في المجال الزمني (ممتازة لـ ETTh2 والأطوال الكبيرة)
         self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
         self.Linear_Seasonal.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len, self.seq_len]))
         
-        # 3. فرع الموسمية الترددي (Frequency-Domain Seasonal)
+        # 3. الموسمية في المجال الترددي (ممتازة لـ ETTh1 والدورات المنتظمة)
         self.Freq_Seasonal = ComplexFreqLinear(self.seq_len, self.pred_len, self.enc_in, self.individual)
         
-        # 4. بوابة دمج تكيفية لكل قناة (Learnable Fusion Gate)
-        # تتعلم تلقائياً الوزن الأمثل بين المجال الزمني والترددي لكل متغير
+        # 4. بوابة دمج قابلة للتعلم لكل قناة (تبدأ متوازنة 0.5 عبر Sigmoid)
         self.alpha = nn.Parameter(torch.zeros(1, self.enc_in, 1))
 
     def forward(self, x):
@@ -198,19 +197,17 @@ class Model(nn.Module):
         x = self.revin(x, 'norm')
         
         seasonal_init, trend_init = self.decomp(x)
-        seasonal_init = seasonal_init.permute(0, 2, 1) # [Batch, channels, seq_len]
-        trend_init = trend_init.permute(0, 2, 1)       # [Batch, channels, seq_len]
+        seasonal_init = seasonal_init.permute(0, 2, 1)
+        trend_init = trend_init.permute(0, 2, 1)
         
-        # التنبؤ بالاتجاه
         trend_output = self.Linear_Trend(trend_init)
         
-        # التنبؤ بالموسمية في المجالين معاً
+        # حساب الموسمية في المجالين ودمجهما تكيفياً
         time_seasonal = self.Linear_Seasonal(seasonal_init)
         freq_seasonal = self.Freq_Seasonal(seasonal_init)
         
-        # دمج تكيفي عبر Sigmoid لضمان بقاء الوزن بين 0 و 1
-        gate = torch.sigmoid(self.alpha)
-        seasonal_output = gate * freq_seasonal + (1 - gate) * time_seasonal
+        w = torch.sigmoid(self.alpha) # قيمة محصورة بين 0 و 1 لكل قناة
+        seasonal_output = w * time_seasonal + (1 - w) * freq_seasonal
         
         x_pred = (seasonal_output + trend_output).permute(0, 2, 1)
         x_pred = self.revin(x_pred, 'denorm')
