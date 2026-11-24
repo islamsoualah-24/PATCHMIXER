@@ -6,39 +6,40 @@ import torch.fft # ضروري لتحويلات فورييه
 # 1. مكون التردد الصحيح (Complex Frequency Upsampling)
 # ==========================================
 class ComplexFreqLinear(nn.Module):
-    def __init__(self, seq_len, pred_len, enc_in, individual=False):
+    def __init__(self, seq_len, pred_len, enc_in, individual=False, cut_freq=25):
         super(ComplexFreqLinear, self).__init__()
         self.seq_len = seq_len
         self.pred_len = pred_len
-        self.total_len = seq_len + pred_len # التنبؤ بالسلسلة كاملة لضمان استمرارية الطور
+        self.total_len = seq_len + pred_len
         self.individual = individual
         self.channels = enc_in
         
-        self.dominance_freq = seq_len // 2 + 1
+        # تطبيق Low-Pass Filter: الاحتفاظ فقط بأول cut_freq تردد وحذف الضوضاء العالية
+        self.dominance_freq = min(cut_freq, seq_len // 2 + 1)
         self.length_ratio = self.total_len / self.seq_len
+        self.out_dominance_freq = int(self.dominance_freq * self.length_ratio)
 
         if self.individual:
             self.freq_upsampler = nn.ModuleList()
             for i in range(self.channels):
                 self.freq_upsampler.append(
-                    nn.Linear(self.dominance_freq, int(self.dominance_freq * self.length_ratio)).to(torch.cfloat)
+                    nn.Linear(self.dominance_freq, self.out_dominance_freq).to(torch.cfloat)
                 )
         else:
-            # طبقة خطية بأعداد مركبة (Complex Weights) تحافظ على الطور والسعة معاً
             self.freq_upsampler = nn.Linear(
-                self.dominance_freq, int(self.dominance_freq * self.length_ratio)
+                self.dominance_freq, self.out_dominance_freq
             ).to(torch.cfloat)
 
     def forward(self, x):
         # x shape: [Batch, channels, seq_len]
         
-        # 1. تحويل فورييه السريع
-        low_specx = torch.fft.rfft(x, dim=-1)
+        # 1. تحويل فورييه السريع واقتطاع الترددات العالية (Low-Pass Filtering)
+        low_specx = torch.fft.rfft(x, dim=-1)[:, :, :self.dominance_freq]
         
-        # 2. الإسقاط الخطي المركب (يوسع الطيف الترددي مع الحفاظ على الطور)
+        # 2. الإسقاط الخطي المركب لتوسيع الطيف الترددي
         if self.individual:
             low_specxy_ = torch.zeros(
-                [low_specx.size(0), self.channels, int(self.dominance_freq * self.length_ratio)],
+                [low_specx.size(0), self.channels, self.out_dominance_freq],
                 dtype=low_specx.dtype, device=low_specx.device
             )
             for i in range(self.channels):
@@ -46,24 +47,22 @@ class ComplexFreqLinear(nn.Module):
         else:
             low_specxy_ = self.freq_upsampler(low_specx)
 
-        # 3. حشو الترددات العالية بالأصفار (Zero-Padding) لتطابق الطول الكلي (seq_len + pred_len)
+        # 3. حشو باقي الطيف بالأصفار (Zero-Padding) ليطابق الطول الكلي (seq_len + pred_len)
         out_freq_dim = self.total_len // 2 + 1
         low_specxy = torch.zeros(
             [low_specxy_.size(0), low_specxy_.size(1), out_freq_dim],
             dtype=low_specxy_.dtype, device=low_specxy_.device
         )
-        # نسخ الترددات المتعلمة إلى بداية الطيف
         min_len = min(low_specxy_.size(-1), out_freq_dim)
         low_specxy[:, :, :min_len] = low_specxy_[:, :, :min_len]
 
-        # 4. التحويل العكسي والضرب في معامل التصحيح (length_ratio) للحفاظ على طاقة الإشارة
+        # 4. التحويل العكسي وضرب الإشارة في معامل التصحيح للحفاظ على الطاقة
         low_xy = torch.fft.irfft(low_specxy, n=self.total_len, dim=-1)
         low_xy = low_xy * self.length_ratio
         
-        # 5. استخراج الجزء الخاص بالمستقبل فقط (آخر pred_len خطوة)
+        # 5. استخراج الجزء الخاص بالتنبؤ فقط (آخر pred_len خطوة)
         pred_seasonal = low_xy[:, :, -self.pred_len:]
         return pred_seasonal
-        
 # ==========================================
 # 1. طبقة التقييس (RevIN)
 # ==========================================
