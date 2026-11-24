@@ -85,7 +85,7 @@ class ComplexFreqLinear(nn.Module):
     """
     Complex Frequency Upsampling with Spectral Dropout
     """
-    def __init__(self, seq_len, pred_len, enc_in, individual=False, dropout=0.1):
+    def __init__(self, seq_len, pred_len, enc_in, individual=False, dropout=0.2):
         super(ComplexFreqLinear, self).__init__()
         self.seq_len = seq_len
         self.pred_len = pred_len
