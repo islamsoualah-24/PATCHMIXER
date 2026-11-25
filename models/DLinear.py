@@ -74,6 +74,51 @@ class series_decomp(nn.Module):
         return res, moving_mean
 
 
+# ==========================================
+# كتلة TSMixer مع Residual Connections (Pre-Norm Architecture)
+# ==========================================
+class TSMixerBlock(nn.Module):
+    def __init__(self, seq_len, channels, dropout=0.2):
+        super(TSMixerBlock, self).__init__()
+        
+        # 1. Time-Mixing (خلط المعلومات عبر الزمن لكل قناة)
+        self.norm_time = nn.LayerNorm(channels)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(seq_len, seq_len),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        # 2. Feature/Channel-Mixing (خلط المعلومات بين المتغيرات المختلفة)
+        self.norm_feat = nn.LayerNorm(channels)
+        self.feat_mlp = nn.Sequential(
+            nn.Linear(channels, channels * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(channels * 2, channels),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        # x shape: [Batch, seq_len, channels]
+        
+        # أ. Time-Mixing + Residual Connection
+        res = x
+        x = self.norm_time(x)
+        x = x.permute(0, 2, 1)      # [Batch, channels, seq_len]
+        x = self.time_mlp(x)
+        x = x.permute(0, 2, 1)      # [Batch, seq_len, channels]
+        x = x + res                 # اتصال متبقٍ أول
+        
+        # ب. Feature-Mixing + Residual Connection
+        res = x
+        x = self.norm_feat(x)
+        x = self.feat_mlp(x)
+        x = x + res                 # اتصال متبقٍ ثانٍ
+        
+        return x
+
+
 class ComplexFreqLinear(nn.Module):
     def __init__(self, seq_len, pred_len, enc_in, individual=False, dropout=0.1):
         super(ComplexFreqLinear, self).__init__()
@@ -131,7 +176,7 @@ class ComplexFreqLinear(nn.Module):
 
 class Model(nn.Module):
     """
-    Channel-Aware Complex-Freq DLinear + RevIN
+    TSMixer-Enhanced Complex-Freq DLinear + RevIN
     """
     def __init__(self, configs):
         super(Model, self).__init__()
@@ -142,6 +187,10 @@ class Model(nn.Module):
         kernel_size = 25
 
         self.revin = RevIN(num_features=self.channels)
+        
+        # كتلة TSMixer لاستخراج التفاعلات الزمنية والمتعددة المتغيرات قبل التفكيك
+        self.tsmixer = TSMixerBlock(seq_len=self.seq_len, channels=self.channels, dropout=0.2)
+        
         self.decomp = series_decomp(kernel_size)
 
         if self.individual:
@@ -159,25 +208,19 @@ class Model(nn.Module):
             dropout=0.1
         )
 
-        # طبقة خلط القنوات المتبقية (Residual Channel-Mixing) لالتقاط القفزات المترابطة بين المتغيرات
-        self.channel_mixer = nn.Sequential(
-            nn.Linear(self.channels, self.channels * 2),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(self.channels * 2, self.channels)
-        )
-        # تهيئة الطبقة الأخيرة بالأصفار لضمان البدء من أداء 0.353 وتحسينه تدريجياً
-        nn.init.zeros_(self.channel_mixer[-1].weight)
-        nn.init.zeros_(self.channel_mixer[-1].bias)
-
     def forward(self, x):
         # x: [Batch, seq_len, channels]
         x = self.revin(x, 'norm')
 
+        # 1. خلط الزمن والقنوات مع Residual Connections (أسلوب TSMixer)
+        x = self.tsmixer(x)
+
+        # 2. التفكيك إلى اتجاه وموسمية
         seasonal_init, trend_init = self.decomp(x)
         seasonal_init = seasonal_init.permute(0, 2, 1)
         trend_init = trend_init.permute(0, 2, 1)
 
+        # 3. التنبؤ
         if self.individual:
             trend_output = torch.zeros(
                 [trend_init.size(0), trend_init.size(1), self.pred_len],
@@ -190,11 +233,8 @@ class Model(nn.Module):
 
         seasonal_output = self.Freq_Seasonal(seasonal_init)
 
-        # دمج الاتجاه والموسمية: [Batch, pred_len, channels]
+        # 4. الدمج والتقييس العكسي
         x_pred = (seasonal_output + trend_output).permute(0, 2, 1)
-
-        # إضافة تصحيح غير خطي عبر القنوات (Residual Connection)
-        x_pred = x_pred + self.channel_mixer(x_pred)
-
         x_pred = self.revin(x_pred, 'denorm')
+
         return x_pred
