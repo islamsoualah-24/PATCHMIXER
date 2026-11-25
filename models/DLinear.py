@@ -63,17 +63,13 @@ class moving_avg(nn.Module):
         return x
 
 
-class multi_scale_decomp(nn.Module):
-    """
-    Multi-Scale Series Decomposition (Daily 25 + Weekly 169)
-    """
-    def __init__(self, kernel_sizes=[25, 169]):
-        super(multi_scale_decomp, self).__init__()
-        self.moving_avgs = nn.ModuleList([moving_avg(k, stride=1) for k in kernel_sizes])
+class series_decomp(nn.Module):
+    def __init__(self, kernel_size):
+        super(series_decomp, self).__init__()
+        self.moving_avg = moving_avg(kernel_size, stride=1)
 
     def forward(self, x):
-        trends = [ma(x) for ma in self.moving_avgs]
-        moving_mean = sum(trends) / len(trends)
+        moving_mean = self.moving_avg(x)
         res = x - moving_mean
         return res, moving_mean
 
@@ -134,17 +130,20 @@ class ComplexFreqLinear(nn.Module):
 
 
 class Model(nn.Module):
+    """
+    Channel-Aware Complex-Freq DLinear + RevIN
+    """
     def __init__(self, configs):
         super(Model, self).__init__()
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
         self.channels = configs.enc_in
         self.individual = getattr(configs, 'individual', False)
+        kernel_size = 25
 
         self.revin = RevIN(num_features=self.channels)
-        self.decomp = multi_scale_decomp(kernel_sizes=[25, 169])
+        self.decomp = series_decomp(kernel_size)
 
-        # ترك التهيئة الافتراضية ليتعلم الميل الحقيقي للاتجاه بدلاً من تجميده عند المتوسط
         if self.individual:
             self.Linear_Trend = nn.ModuleList([
                 nn.Linear(self.seq_len, self.pred_len) for _ in range(self.channels)
@@ -160,7 +159,19 @@ class Model(nn.Module):
             dropout=0.1
         )
 
+        # طبقة خلط القنوات المتبقية (Residual Channel-Mixing) لالتقاط القفزات المترابطة بين المتغيرات
+        self.channel_mixer = nn.Sequential(
+            nn.Linear(self.channels, self.channels * 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(self.channels * 2, self.channels)
+        )
+        # تهيئة الطبقة الأخيرة بالأصفار لضمان البدء من أداء 0.353 وتحسينه تدريجياً
+        nn.init.zeros_(self.channel_mixer[-1].weight)
+        nn.init.zeros_(self.channel_mixer[-1].bias)
+
     def forward(self, x):
+        # x: [Batch, seq_len, channels]
         x = self.revin(x, 'norm')
 
         seasonal_init, trend_init = self.decomp(x)
@@ -179,7 +190,11 @@ class Model(nn.Module):
 
         seasonal_output = self.Freq_Seasonal(seasonal_init)
 
+        # دمج الاتجاه والموسمية: [Batch, pred_len, channels]
         x_pred = (seasonal_output + trend_output).permute(0, 2, 1)
-        x_pred = self.revin(x_pred, 'denorm')
 
+        # إضافة تصحيح غير خطي عبر القنوات (Residual Connection)
+        x_pred = x_pred + self.channel_mixer(x_pred)
+
+        x_pred = self.revin(x_pred, 'denorm')
         return x_pred
