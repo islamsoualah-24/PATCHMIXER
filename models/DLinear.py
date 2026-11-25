@@ -49,9 +49,6 @@ class RevIN(nn.Module):
 
 
 class moving_avg(nn.Module):
-    """
-    Moving average block to highlight the trend of time series
-    """
     def __init__(self, kernel_size, stride):
         super(moving_avg, self).__init__()
         self.kernel_size = kernel_size
@@ -66,24 +63,22 @@ class moving_avg(nn.Module):
         return x
 
 
-class series_decomp(nn.Module):
+class multi_scale_decomp(nn.Module):
     """
-    Series decomposition block
+    Multi-Scale Series Decomposition (Daily 25 + Weekly 169)
     """
-    def __init__(self, kernel_size):
-        super(series_decomp, self).__init__()
-        self.moving_avg = moving_avg(kernel_size, stride=1)
+    def __init__(self, kernel_sizes=[25, 169]):
+        super(multi_scale_decomp, self).__init__()
+        self.moving_avgs = nn.ModuleList([moving_avg(k, stride=1) for k in kernel_sizes])
 
     def forward(self, x):
-        moving_mean = self.moving_avg(x)
+        trends = [ma(x) for ma in self.moving_avgs]
+        moving_mean = sum(trends) / len(trends)
         res = x - moving_mean
         return res, moving_mean
 
 
 class ComplexFreqLinear(nn.Module):
-    """
-    Complex Frequency Upsampling with Spectral Dropout
-    """
     def __init__(self, seq_len, pred_len, enc_in, individual=False, dropout=0.1):
         super(ComplexFreqLinear, self).__init__()
         self.seq_len = seq_len
@@ -108,7 +103,6 @@ class ComplexFreqLinear(nn.Module):
             ).to(torch.cfloat)
 
     def forward(self, x):
-        # x shape: [Batch, channels, seq_len]
         low_specx = torch.fft.rfft(x, dim=-1)
         
         if self.training:
@@ -140,32 +134,23 @@ class ComplexFreqLinear(nn.Module):
 
 
 class Model(nn.Module):
-    """
-    DLinear + RevIN + Complex Frequency Seasonal + Dual-Branch Dropout
-    """
     def __init__(self, configs):
         super(Model, self).__init__()
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
         self.channels = configs.enc_in
         self.individual = getattr(configs, 'individual', False)
-        kernel_size = 25
 
         self.revin = RevIN(num_features=self.channels)
-        self.decomp = series_decomp(kernel_size)
+        self.decomp = multi_scale_decomp(kernel_sizes=[25, 169])
 
-        # Dropout بسيط لفرع الاتجاه (Trend) لمنع التخصيص الزائد في الأفق الطويل
-        self.trend_dropout = nn.Dropout(p=0.1)
-
+        # ترك التهيئة الافتراضية ليتعلم الميل الحقيقي للاتجاه بدلاً من تجميده عند المتوسط
         if self.individual:
-            self.Linear_Trend = nn.ModuleList()
-            for i in range(self.channels):
-                layer = nn.Linear(self.seq_len, self.pred_len)
-                layer.weight = nn.Parameter((1 / self.seq_len) * torch.ones([self.pred_len, self.seq_len]))
-                self.Linear_Trend.append(layer)
+            self.Linear_Trend = nn.ModuleList([
+                nn.Linear(self.seq_len, self.pred_len) for _ in range(self.channels)
+            ])
         else:
             self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
-            self.Linear_Trend.weight = nn.Parameter((1 / self.seq_len) * torch.ones([self.pred_len, self.seq_len]))
 
         self.Freq_Seasonal = ComplexFreqLinear(
             seq_len=self.seq_len,
@@ -176,25 +161,21 @@ class Model(nn.Module):
         )
 
     def forward(self, x):
-        # x: [Batch, Input length, Channel]
         x = self.revin(x, 'norm')
 
         seasonal_init, trend_init = self.decomp(x)
         seasonal_init = seasonal_init.permute(0, 2, 1)
         trend_init = trend_init.permute(0, 2, 1)
 
-        # تطبيق Dropout على مدخلات الاتجاه أثناء التدريب فقط
-        trend_in = self.trend_dropout(trend_init)
-
         if self.individual:
             trend_output = torch.zeros(
-                [trend_in.size(0), trend_in.size(1), self.pred_len],
-                dtype=trend_in.dtype, device=trend_in.device
+                [trend_init.size(0), trend_init.size(1), self.pred_len],
+                dtype=trend_init.dtype, device=trend_init.device
             )
             for i in range(self.channels):
-                trend_output[:, i, :] = self.Linear_Trend[i](trend_in[:, i, :])
+                trend_output[:, i, :] = self.Linear_Trend[i](trend_init[:, i, :])
         else:
-            trend_output = self.Linear_Trend(trend_in)
+            trend_output = self.Linear_Trend(trend_init)
 
         seasonal_output = self.Freq_Seasonal(seasonal_init)
 
