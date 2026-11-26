@@ -12,7 +12,7 @@ class AdaptiveRevIN(nn.Module):
         eps: float = 1e-5,
         affine: bool = True,
         num_slices: int = 4,
-        out_slices: int = 4,
+        out_slices: int = 1,
         hidden_dim: int = 16,
         max_scale_shift: float = 0.5,
     ):
