@@ -3,72 +3,30 @@ import torch.nn as nn
 import torch.fft
 
 # ==========================================
-# 1. مكون خلط القنوات المركب (فهم العلاقات بين المتغيرات)
-# ==========================================
-class ComplexChannelMixer(nn.Module):
-    def __init__(self, channels, reduction=2, dropout=0.1):
-        super(ComplexChannelMixer, self).__init__()
-        # استخدام عنق زجاجة (Bottleneck) لتقليل المعاملات ومنع Overfitting
-        hidden_dim = max(channels // reduction, 8)
-        
-        self.fc1 = nn.Linear(channels, hidden_dim).to(torch.cfloat)
-        self.fc2 = nn.Linear(hidden_dim, channels).to(torch.cfloat)
-        self.dropout = nn.Dropout(dropout)
-        
-        # معامل البوابة يبدأ من 0.0 لضمان استقرار التدريب (Zero-Init Residual)
-        self.alpha = nn.Parameter(torch.zeros(1, channels, 1))
-
-    def complex_gelu(self, z):
-        # تطبيق دالة التنشيط على الجزء الحقيقي والتخيلي بشكل منفصل
-        return torch.complex(
-            nn.functional.gelu(z.real),
-            nn.functional.gelu(z.imag)
-        )
-
-    def complex_dropout(self, z):
-        # تطبيق Dropout بنفس القناع على الحقيقي والتخيلي للحفاظ على الطور
-        if not self.training:
-            return z
-        mask = torch.ones_like(z.real)
-        mask = self.dropout(mask)
-        return z * mask
-
-    def forward(self, x_freq):
-        # x_freq shape: [Batch, channels, freq_dim] (Complex)
-        
-        # نقل القنوات للبعد الأخير لتطبيق الطبقات الخطية عليها
-        x_perm = x_freq.permute(0, 2, 1)  # [Batch, freq_dim, channels]
-        
-        out = self.fc1(x_perm)
-        out = self.complex_gelu(out)
-        out = self.complex_dropout(out)
-        out = self.fc2(out)
-        
-        out = out.permute(0, 2, 1)  # [Batch, channels, freq_dim]
-        
-        # الدمج التكيفي مع الاتصال المتبقي
-        return x_freq + self.alpha * out
-
-
-# ==========================================
-# 2. مكون التردد المركب مع خيار خلط القنوات
+# 1. مكون التردد المركب مع منع تسرب الطيف
 # ==========================================
 class ComplexFreqLinear(nn.Module):
-    def __init__(self, seq_len, pred_len, enc_in, individual=False, use_channel_mixing=True):
+    def __init__(self, seq_len, pred_len, enc_in, individual=False):
         super(ComplexFreqLinear, self).__init__()
         self.seq_len = seq_len
         self.pred_len = pred_len
         self.total_len = seq_len + pred_len
         self.individual = individual
         self.channels = enc_in
-        self.use_channel_mixing = use_channel_mixing and (enc_in > 1)
         
         self.dominance_freq = seq_len // 2 + 1
         self.length_ratio = self.total_len / self.seq_len
 
-        # إضافة وحدة فهم العلاقات بين المتغيرات
-        if self.use_channel_mixing:
-            self.channel_mixer = ComplexChannelMixer(enc_in)
+        # شبكة زمنية [0 -> 1] لبناء جسر الحدود (تنتقل تلقائياً للـ GPU)
+        self.register_buffer(
+            "ramp_grid", 
+            torch.linspace(0, 1, steps=seq_len).view(1, 1, seq_len)
+        )
+
+        # طبقة خفيفة لاستعادة أثر نقطتي البداية والنهاية في المستقبل بأمان
+        self.boundary_proj = nn.Linear(2, pred_len)
+        nn.init.zeros_(self.boundary_proj.weight)
+        nn.init.zeros_(self.boundary_proj.bias)
 
         if self.individual:
             self.freq_upsampler = nn.ModuleList([
@@ -83,14 +41,16 @@ class ComplexFreqLinear(nn.Module):
     def forward(self, x):
         # x shape: [Batch, channels, seq_len]
         
-        # 1. تحويل فورييه السريع
-        low_specx = torch.fft.rfft(x, dim=-1)
+        # 1. إزالة قفزة الحدود لجعل الإشارة دورية (x_periodic[0] == x_periodic[-1] == 0)
+        x_start = x[:, :, 0:1]
+        x_end = x[:, :, -1:]
+        bridge = x_start + (x_end - x_start) * self.ramp_grid
+        x_periodic = x - bridge
         
-        # 2. التقاط العلاقات بين المتغيرات في المجال الترددي قبل التوسيع
-        if self.use_channel_mixing:
-            low_specx = self.channel_mixer(low_specx)
+        # 2. تحويل فورييه السريع على الإشارة الخالية من تسرب الطيف
+        low_specx = torch.fft.rfft(x_periodic, dim=-1)
         
-        # 3. الإسقاط الخطي المركب لتوسيع الطيف
+        # 3. الإسقاط الخطي المركب
         if self.individual:
             low_specxy_ = torch.zeros(
                 [low_specx.size(0), self.channels, int(self.dominance_freq * self.length_ratio)],
@@ -101,7 +61,7 @@ class ComplexFreqLinear(nn.Module):
         else:
             low_specxy_ = self.freq_upsampler(low_specx)
 
-        # 4. حشو الترددات العالية بالأصفار (Zero-Padding)
+        # 4. حشو الترددات العالية بالأصفار
         out_freq_dim = self.total_len // 2 + 1
         low_specxy = torch.zeros(
             [low_specxy_.size(0), low_specxy_.size(1), out_freq_dim],
@@ -110,15 +70,20 @@ class ComplexFreqLinear(nn.Module):
         min_len = min(low_specxy_.size(-1), out_freq_dim)
         low_specxy[:, :, :min_len] = low_specxy_[:, :, :min_len]
 
-        # 5. التحويل العكسي واستخراج المستقبل
+        # 5. التحويل العكسي وضبط الطاقة
         low_xy = torch.fft.irfft(low_specxy, n=self.total_len, dim=-1)
         low_xy = low_xy * self.length_ratio
+        pred_seasonal = low_xy[:, :, -self.pred_len:]
         
-        return low_xy[:, :, -self.pred_len:]
+        # 6. استعادة مساهمة الحدود في المستقبل
+        endpoints = torch.cat([x_start, x_end], dim=-1)  # [Batch, channels, 2]
+        boundary_pred = self.boundary_proj(endpoints)    # [Batch, channels, pred_len]
+        
+        return pred_seasonal + boundary_pred
 
 
 # ==========================================
-# 3. طبقة التقييس (RevIN) ومكون التفكيك
+# 2. طبقة التقييس (RevIN) ومكون التفكيك
 # ==========================================
 class RevIN(nn.Module):
     def __init__(self, num_features: int, eps=1e-5, affine=True):
@@ -170,7 +135,7 @@ class series_decomp(nn.Module):
 
 
 # ==========================================
-# 4. النموذج المدمج النهائي
+# 3. النموذج المدمج
 # ==========================================
 class Model(nn.Module): 
     def __init__(self, configs): 
@@ -179,25 +144,17 @@ class Model(nn.Module):
         self.pred_len = configs.pred_len
         self.enc_in = configs.enc_in
         self.individual = getattr(configs, 'individual', False)
-        self.use_channel_mixing = getattr(configs, 'use_channel_mixing', True)
         kernel_size = 25 
         
         self.revin = RevIN(num_features=self.enc_in)
         self.decomp = series_decomp(kernel_size)
         
-        # الاتجاه في المجال الزمني
         self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
         self.Linear_Trend.weight = nn.Parameter((1 / self.seq_len) * torch.ones([self.pred_len, self.seq_len]))
         
-        # الموسمية في المجال الترددي المركب + فهم العلاقات بين المتغيرات
-        self.Freq_Seasonal = ComplexFreqLinear(
-            self.seq_len, self.pred_len, self.enc_in, 
-            individual=self.individual, 
-            use_channel_mixing=self.use_channel_mixing
-        )
+        self.Freq_Seasonal = ComplexFreqLinear(self.seq_len, self.pred_len, self.enc_in, self.individual)
 
     def forward(self, x):
-        # x: [Batch, seq_len, channels]
         x = self.revin(x, 'norm')
         
         seasonal_init, trend_init = self.decomp(x)
