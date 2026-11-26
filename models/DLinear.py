@@ -2,7 +2,124 @@ import torch
 import torch.nn as nn
 import torch.fft
 
+# ==========================================
+# 1. مكون خلط القنوات المركب (فهم العلاقات بين المتغيرات)
+# ==========================================
+class ComplexChannelMixer(nn.Module):
+    def __init__(self, channels, reduction=2, dropout=0.1):
+        super(ComplexChannelMixer, self).__init__()
+        # استخدام عنق زجاجة (Bottleneck) لتقليل المعاملات ومنع Overfitting
+        hidden_dim = max(channels // reduction, 8)
+        
+        self.fc1 = nn.Linear(channels, hidden_dim).to(torch.cfloat)
+        self.fc2 = nn.Linear(hidden_dim, channels).to(torch.cfloat)
+        self.dropout = nn.Dropout(dropout)
+        
+        # معامل البوابة يبدأ من 0.0 لضمان استقرار التدريب (Zero-Init Residual)
+        self.alpha = nn.Parameter(torch.zeros(1, channels, 1))
 
+    def complex_gelu(self, z):
+        # تطبيق دالة التنشيط على الجزء الحقيقي والتخيلي بشكل منفصل
+        return torch.complex(
+            nn.functional.gelu(z.real),
+            nn.functional.gelu(z.imag)
+        )
+
+    def complex_dropout(self, z):
+        # تطبيق Dropout بنفس القناع على الحقيقي والتخيلي للحفاظ على الطور
+        if not self.training:
+            return z
+        mask = torch.ones_like(z.real)
+        mask = self.dropout(mask)
+        return z * mask
+
+    def forward(self, x_freq):
+        # x_freq shape: [Batch, channels, freq_dim] (Complex)
+        
+        # نقل القنوات للبعد الأخير لتطبيق الطبقات الخطية عليها
+        x_perm = x_freq.permute(0, 2, 1)  # [Batch, freq_dim, channels]
+        
+        out = self.fc1(x_perm)
+        out = self.complex_gelu(out)
+        out = self.complex_dropout(out)
+        out = self.fc2(out)
+        
+        out = out.permute(0, 2, 1)  # [Batch, channels, freq_dim]
+        
+        # الدمج التكيفي مع الاتصال المتبقي
+        return x_freq + self.alpha * out
+
+
+# ==========================================
+# 2. مكون التردد المركب مع خيار خلط القنوات
+# ==========================================
+class ComplexFreqLinear(nn.Module):
+    def __init__(self, seq_len, pred_len, enc_in, individual=False, use_channel_mixing=True):
+        super(ComplexFreqLinear, self).__init__()
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        self.total_len = seq_len + pred_len
+        self.individual = individual
+        self.channels = enc_in
+        self.use_channel_mixing = use_channel_mixing and (enc_in > 1)
+        
+        self.dominance_freq = seq_len // 2 + 1
+        self.length_ratio = self.total_len / self.seq_len
+
+        # إضافة وحدة فهم العلاقات بين المتغيرات
+        if self.use_channel_mixing:
+            self.channel_mixer = ComplexChannelMixer(enc_in)
+
+        if self.individual:
+            self.freq_upsampler = nn.ModuleList([
+                nn.Linear(self.dominance_freq, int(self.dominance_freq * self.length_ratio)).to(torch.cfloat)
+                for _ in range(self.channels)
+            ])
+        else:
+            self.freq_upsampler = nn.Linear(
+                self.dominance_freq, int(self.dominance_freq * self.length_ratio)
+            ).to(torch.cfloat)
+
+    def forward(self, x):
+        # x shape: [Batch, channels, seq_len]
+        
+        # 1. تحويل فورييه السريع
+        low_specx = torch.fft.rfft(x, dim=-1)
+        
+        # 2. التقاط العلاقات بين المتغيرات في المجال الترددي قبل التوسيع
+        if self.use_channel_mixing:
+            low_specx = self.channel_mixer(low_specx)
+        
+        # 3. الإسقاط الخطي المركب لتوسيع الطيف
+        if self.individual:
+            low_specxy_ = torch.zeros(
+                [low_specx.size(0), self.channels, int(self.dominance_freq * self.length_ratio)],
+                dtype=low_specx.dtype, device=low_specx.device
+            )
+            for i in range(self.channels):
+                low_specxy_[:, i, :] = self.freq_upsampler[i](low_specx[:, i, :])
+        else:
+            low_specxy_ = self.freq_upsampler(low_specx)
+
+        # 4. حشو الترددات العالية بالأصفار (Zero-Padding)
+        out_freq_dim = self.total_len // 2 + 1
+        low_specxy = torch.zeros(
+            [low_specxy_.size(0), low_specxy_.size(1), out_freq_dim],
+            dtype=low_specxy_.dtype, device=low_specxy_.device
+        )
+        min_len = min(low_specxy_.size(-1), out_freq_dim)
+        low_specxy[:, :, :min_len] = low_specxy_[:, :, :min_len]
+
+        # 5. التحويل العكسي واستخراج المستقبل
+        low_xy = torch.fft.irfft(low_specxy, n=self.total_len, dim=-1)
+        low_xy = low_xy * self.length_ratio
+        
+        return low_xy[:, :, -self.pred_len:]
+
+
+# ==========================================
+# 3. طبقة التقييس (RevIN) ومكون التفكيك
+# ==========================================
 class RevIN(nn.Module):
     def __init__(self, num_features: int, eps=1e-5, affine=True):
         super(RevIN, self).__init__()
@@ -10,43 +127,23 @@ class RevIN(nn.Module):
         self.eps = eps
         self.affine = affine
         if self.affine:
-            self._init_params()
+            self.affine_weight = nn.Parameter(torch.ones(self.num_features))
+            self.affine_bias = nn.Parameter(torch.zeros(self.num_features))
 
     def forward(self, x, mode: str):
         if mode == 'norm':
-            self._get_statistics(x)
-            x = self._normalize(x)
+            self.mean = torch.mean(x, dim=1, keepdim=True).detach()
+            self.stdev = torch.sqrt(torch.var(x, dim=1, keepdim=True, unbiased=False) + self.eps).detach()
+            x = (x - self.mean) / self.stdev
+            if self.affine:
+                x = x * self.affine_weight + self.affine_bias
         elif mode == 'denorm':
-            x = self._denormalize(x)
+            if self.affine:
+                x = (x - self.affine_bias) / (self.affine_weight + self.eps * self.eps)
+            x = x * self.stdev + self.mean
         else:
             raise NotImplementedError
         return x
-
-    def _init_params(self):
-        self.affine_weight = nn.Parameter(torch.ones(self.num_features))
-        self.affine_bias = nn.Parameter(torch.zeros(self.num_features))
-
-    def _get_statistics(self, x):
-        dim2reduce = tuple(range(1, x.ndim - 1))
-        self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
-        self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
-
-    def _normalize(self, x):
-        x = x - self.mean
-        x = x / self.stdev
-        if self.affine:
-            x = x * self.affine_weight
-            x = x + self.affine_bias
-        return x
-
-    def _denormalize(self, x):
-        if self.affine:
-            x = x - self.affine_bias
-            x = x / (self.affine_weight + self.eps * self.eps)
-        x = x * self.stdev
-        x = x + self.mean
-        return x
-
 
 class moving_avg(nn.Module):
     def __init__(self, kernel_size, stride):
@@ -59,9 +156,7 @@ class moving_avg(nn.Module):
         end = x[:, -1:, :].repeat(1, (self.kernel_size - 1) // 2, 1)
         x = torch.cat([front, x, end], dim=1)
         x = self.avg(x.permute(0, 2, 1))
-        x = x.permute(0, 2, 1)
-        return x
-
+        return x.permute(0, 2, 1)
 
 class series_decomp(nn.Module):
     def __init__(self, kernel_size):
@@ -74,134 +169,45 @@ class series_decomp(nn.Module):
         return res, moving_mean
 
 
-class ComplexFreqLinear(nn.Module):
-    def __init__(self, seq_len, pred_len, enc_in, individual=False, dropout=0.1):
-        super(ComplexFreqLinear, self).__init__()
-        self.seq_len = seq_len
-        self.pred_len = pred_len
-        self.total_len = seq_len + pred_len
-        self.individual = individual
-        self.channels = enc_in
-        
-        self.dominance_freq = seq_len // 2 + 1
-        self.length_ratio = self.total_len / self.seq_len
-        self.dropout = nn.Dropout(p=dropout)
-
-        if self.individual:
-            self.freq_upsampler = nn.ModuleList()
-            for i in range(self.channels):
-                self.freq_upsampler.append(
-                    nn.Linear(self.dominance_freq, int(self.dominance_freq * self.length_ratio)).to(torch.cfloat)
-                )
-        else:
-            self.freq_upsampler = nn.Linear(
-                self.dominance_freq, int(self.dominance_freq * self.length_ratio)
-            ).to(torch.cfloat)
-
-    def forward(self, x):
-        low_specx = torch.fft.rfft(x, dim=-1)
-        
-        if self.training:
-            low_specx = torch.complex(self.dropout(low_specx.real), self.dropout(low_specx.imag))
-
-        if self.individual:
-            low_specxy_ = torch.zeros(
-                [low_specx.size(0), self.channels, int(self.dominance_freq * self.length_ratio)],
-                dtype=low_specx.dtype, device=low_specx.device
-            )
-            for i in range(self.channels):
-                low_specxy_[:, i, :] = self.freq_upsampler[i](low_specx[:, i, :])
-        else:
-            low_specxy_ = self.freq_upsampler(low_specx)
-
-        out_freq_dim = self.total_len // 2 + 1
-        low_specxy = torch.zeros(
-            [low_specxy_.size(0), low_specxy_.size(1), out_freq_dim],
-            dtype=low_specxy_.dtype, device=low_specxy_.device
-        )
-        min_len = min(low_specxy_.size(-1), out_freq_dim)
-        low_specxy[:, :, :min_len] = low_specxy_[:, :, :min_len]
-
-        low_xy = torch.fft.irfft(low_specxy, n=self.total_len, dim=-1)
-        low_xy = low_xy * self.length_ratio
-        
-        pred_seasonal = low_xy[:, :, -self.pred_len:]
-        return pred_seasonal
-
-
-class Model(nn.Module):
-    """
-    DLinear + RevIN + Complex Frequency Seasonal + Trend Residual Connection
-    """
-    def __init__(self, configs):
+# ==========================================
+# 4. النموذج المدمج النهائي
+# ==========================================
+class Model(nn.Module): 
+    def __init__(self, configs): 
         super(Model, self).__init__()
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
-        self.channels = configs.enc_in
+        self.enc_in = configs.enc_in
         self.individual = getattr(configs, 'individual', False)
-        kernel_size = 25
-
-        self.revin = RevIN(num_features=self.channels)
+        self.use_channel_mixing = getattr(configs, 'use_channel_mixing', True)
+        kernel_size = 25 
+        
+        self.revin = RevIN(num_features=self.enc_in)
         self.decomp = series_decomp(kernel_size)
-
-        # تهيئة أوزان الاتجاه بالأصفار لأن Residual Connection سيحمل القيمة الأساسية
-        if self.individual:
-            self.Linear_Trend = nn.ModuleList()
-            for i in range(self.channels):
-                layer = nn.Linear(self.seq_len, self.pred_len)
-                nn.init.zeros_(layer.weight)
-                nn.init.zeros_(layer.bias)
-                self.Linear_Trend.append(layer)
-        else:
-            self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
-            nn.init.zeros_(self.Linear_Trend.weight)
-            nn.init.zeros_(self.Linear_Trend.bias)
-
+        
+        # الاتجاه في المجال الزمني
+        self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
+        self.Linear_Trend.weight = nn.Parameter((1 / self.seq_len) * torch.ones([self.pred_len, self.seq_len]))
+        
+        # الموسمية في المجال الترددي المركب + فهم العلاقات بين المتغيرات
         self.Freq_Seasonal = ComplexFreqLinear(
-            seq_len=self.seq_len,
-            pred_len=self.pred_len,
-            enc_in=self.channels,
-            individual=self.individual,
-            dropout=0.1
+            self.seq_len, self.pred_len, self.enc_in, 
+            individual=self.individual, 
+            use_channel_mixing=self.use_channel_mixing
         )
 
     def forward(self, x):
-        # x: [Batch, Input length, Channel]
+        # x: [Batch, seq_len, channels]
         x = self.revin(x, 'norm')
-
-        seasonal_init, trend_init = self.decomp(x)
-        seasonal_init = seasonal_init.permute(0, 2, 1)  # [Batch, Channel, seq_len]
-        trend_init = trend_init.permute(0, 2, 1)        # [Batch, Channel, seq_len]
-
-        # ==========================================
-        # فرع الاتجاه مع Residual Connection
-        # ==========================================
-        # 1. استخراج آخر نقطة في الاتجاه كمرساة (Anchor)
-        trend_last = trend_init[:, :, -1:].detach()  # [Batch, Channel, 1]
         
-        # 2. طرح المرساة ليتعلم النموذج التغير التفاضلي (Delta Trend)
-        trend_diff = trend_init - trend_last
-
-        if self.individual:
-            trend_output = torch.zeros(
-                [trend_init.size(0), trend_init.size(1), self.pred_len],
-                dtype=trend_init.dtype, device=trend_init.device
-            )
-            for i in range(self.channels):
-                trend_output[:, i, :] = self.Linear_Trend[i](trend_diff[:, i, :])
-        else:
-            trend_output = self.Linear_Trend(trend_diff)
-
-        # 3. إضافة المرساة مرة أخرى (Residual Connection)
-        trend_output = trend_output + trend_last
-
-        # ==========================================
-        # فرع الموسمية في المجال الترددي
-        # ==========================================
+        seasonal_init, trend_init = self.decomp(x)
+        seasonal_init = seasonal_init.permute(0, 2, 1)
+        trend_init = trend_init.permute(0, 2, 1)
+        
+        trend_output = self.Linear_Trend(trend_init)
         seasonal_output = self.Freq_Seasonal(seasonal_init)
-
-        # دمج الفرعين والتقييس العكسي
+        
         x_pred = (seasonal_output + trend_output).permute(0, 2, 1)
         x_pred = self.revin(x_pred, 'denorm')
-
+        
         return x_pred
