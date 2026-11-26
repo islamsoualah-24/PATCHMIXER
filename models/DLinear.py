@@ -77,7 +77,7 @@ class series_decomp(nn.Module):
 # 3. خليط الخبراء الخطيين الموجه ترددياً (Spectral-Guided MoLE)
 # ==========================================
 class SpectralMoLE(nn.Module):
-    def __init__(self, seq_len, pred_len, num_experts=10, max_freq_bins=64, dropout=0.1):
+    def __init__(self, seq_len, pred_len, num_experts=10, max_freq_bins=64, dropout=0.2):
         super(SpectralMoLE, self).__init__()
         self.seq_len = seq_len
         self.pred_len = pred_len
