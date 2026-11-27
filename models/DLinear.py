@@ -1,71 +1,8 @@
 import torch
 import torch.nn as nn
-import torch.fft
-
 
 # ==========================================
-# 1. مكون التردد المركب (Complex Frequency Upsampling)
-# ==========================================
-class ComplexFreqLinear(nn.Module):
-    def __init__(self, seq_len, pred_len, enc_in, individual=False):
-        super(ComplexFreqLinear, self).__init__()
-        self.seq_len = seq_len
-        self.pred_len = pred_len
-        self.total_len = seq_len + pred_len
-        self.individual = individual
-        self.channels = enc_in
-
-        self.dominance_freq = seq_len // 2 + 1
-        self.length_ratio = self.total_len / self.seq_len
-
-        if self.individual:
-            self.freq_upsampler = nn.ModuleList()
-            for _ in range(self.channels):
-                self.freq_upsampler.append(
-                    nn.Linear(
-                        self.dominance_freq,
-                        int(self.dominance_freq * self.length_ratio)
-                    ).to(torch.cfloat)
-                )
-        else:
-            self.freq_upsampler = nn.Linear(
-                self.dominance_freq,
-                int(self.dominance_freq * self.length_ratio)
-            ).to(torch.cfloat)
-
-    def forward(self, x):
-        # x shape: [Batch, channels, seq_len]
-        low_specx = torch.fft.rfft(x, dim=-1)
-
-        if self.individual:
-            low_specxy_ = torch.zeros(
-                [low_specx.size(0), self.channels, int(self.dominance_freq * self.length_ratio)],
-                dtype=low_specx.dtype,
-                device=low_specx.device
-            )
-            for i in range(self.channels):
-                low_specxy_[:, i, :] = self.freq_upsampler[i](low_specx[:, i, :])
-        else:
-            low_specxy_ = self.freq_upsampler(low_specx)
-
-        out_freq_dim = self.total_len // 2 + 1
-        low_specxy = torch.zeros(
-            [low_specxy_.size(0), low_specxy_.size(1), out_freq_dim],
-            dtype=low_specxy_.dtype,
-            device=low_specxy_.device
-        )
-        min_len = min(low_specxy_.size(-1), out_freq_dim)
-        low_specxy[:, :, :min_len] = low_specxy_[:, :, :min_len]
-
-        low_xy = torch.fft.irfft(low_specxy, n=self.total_len, dim=-1)
-        low_xy = low_xy * self.length_ratio
-
-        pred_seasonal = low_xy[:, :, -self.pred_len:]
-        return pred_seasonal
-
-
-# ==========================================
-# 2. طبقة التقييس (RevIN)
+# 1. طبقة التقييس العكسي (RevIN)
 # ==========================================
 class RevIN(nn.Module):
     def __init__(self, num_features: int, eps=1e-5, affine=True):
@@ -91,10 +28,9 @@ class RevIN(nn.Module):
         self.affine_bias = nn.Parameter(torch.zeros(self.num_features))
 
     def _get_statistics(self, x):
-        self.mean = torch.mean(x, dim=1, keepdim=True).detach()
-        self.stdev = torch.sqrt(
-            torch.var(x, dim=1, keepdim=True, unbiased=False) + self.eps
-        ).detach()
+        dim2reduce = tuple(range(1, x.ndim - 1))
+        self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
+        self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
 
     def _normalize(self, x):
         x = x - self.mean
@@ -114,7 +50,7 @@ class RevIN(nn.Module):
 
 
 # ==========================================
-# 3. مكون التفكيك (Series Decomposition)
+# 2. مكون التفكيك (Series Decomposition)
 # ==========================================
 class moving_avg(nn.Module):
     def __init__(self, kernel_size, stride):
@@ -130,7 +66,6 @@ class moving_avg(nn.Module):
         x = x.permute(0, 2, 1)
         return x
 
-
 class series_decomp(nn.Module):
     def __init__(self, kernel_size):
         super(series_decomp, self).__init__()
@@ -143,95 +78,120 @@ class series_decomp(nn.Module):
 
 
 # ==========================================
-# 4. كتلة التصحيح الديناميكي المتبقي (RK4 Residual Correction) - الإضافة الجديدة
+# 3. دالة المعادلة التفاضلية وكتلة RK4
 # ==========================================
-class RK4ResidualCorrection(nn.Module):
+class ODEFunc(nn.Module):
     """
-    تعمل كتصحيح ديناميكي غير خطي فوق مخرج Linear_Trend:
-    T_out = T_linear + (h / 6) * (k1 + 2*k2 + 2*k3 + k4)
+    تمثل المشتقة dh/dt = f_theta(h) في الفضاء الكامن.
+    نستخدم دالة التفعيل Tanh لأنها ناعمة (Smooth) ومثالية للاستقرار العددي في RK4.
     """
-    def __init__(self, pred_len, hidden_dim=32, num_steps=1, max_h=1.0):
-        super(RK4ResidualCorrection, self).__init__()
-        self.num_steps = num_steps
-        self.max_h = max_h
-
-        # شبكة ديناميكية صغيرة ومقيدة (Bounded & Lipschitz-constrained)
-        self.f_theta = nn.Sequential(
-            nn.utils.parametrizations.spectral_norm(nn.Linear(pred_len, hidden_dim)),
+    def __init__(self, d_model):
+        super(ODEFunc, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, d_model),
             nn.Tanh(),
-            nn.utils.parametrizations.spectral_norm(nn.Linear(hidden_dim, pred_len)),
-            nn.Tanh()
+            nn.Linear(d_model, d_model)
         )
+        # تهيئة الأوزان بقيم صغيرة في البداية لضمان استقرار التكامل العددي
+        for m in self.net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0, std=0.01)
+                nn.init.constant_(m.bias, val=0)
 
-        # حجم خطوة h قابل للتعلم ومقيد ضمن (0, max_h)
-        # التهيئة عند -3.0 تعطي h ≈ 0.047 في بداية التدريب لضمان استقرار المسار الخطي
-        self.raw_h = nn.Parameter(torch.tensor(-3.0))
+    def forward(self, h):
+        return self.net(h)
 
-    def forward(self, z_linear):
-        # z_linear shape: [Batch, channels, pred_len]
-        h = (self.max_h * torch.sigmoid(self.raw_h)) / self.num_steps
-        z = z_linear
 
+class RK4Block(nn.Module):
+    """
+    كتلة التكامل العددي بطريقة رونج-كوتا من الرتبة الرابعة (Fixed-step RK4)
+    """
+    def __init__(self, d_model, num_steps=4):
+        super(RK4Block, self).__init__()
+        self.ode_func = ODEFunc(d_model)
+        self.num_steps = num_steps
+        self.dt = 1.0 / num_steps  # حجم الخطوة الزمنية
+
+    def forward(self, h):
         for _ in range(self.num_steps):
-            k1 = self.f_theta(z)
-            k2 = self.f_theta(z + 0.5 * h * k1)
-            k3 = self.f_theta(z + 0.5 * h * k2)
-            k4 = self.f_theta(z + h * k3)
-            z = z + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-
-        return z
+            k1 = self.ode_func(h)
+            k2 = self.ode_func(h + 0.5 * self.dt * k1)
+            k3 = self.ode_func(h + 0.5 * self.dt * k2)
+            k4 = self.ode_func(h + self.dt * k3)
+            h = h + (self.dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        return h
 
 
 # ==========================================
-# 5. النموذج المدمج (Complex-Freq DLinear + RK4 Residual Trend + RevIN)
+# 4. النموذج المطور (RK4-DLinear + RevIN)
 # ==========================================
 class Model(nn.Module):
     def __init__(self, configs):
         super(Model, self).__init__()
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
-        self.enc_in = configs.enc_in
-        self.individual = getattr(configs, 'individual', False)
-        rk4_hidden = getattr(configs, 'rk4_hidden', 32)
-        rk4_steps = getattr(configs, 'rk4_steps', 1)
+        enc_in = configs.enc_in
         kernel_size = 25
 
-        self.revin = RevIN(num_features=self.enc_in)
+        # معاملات اختيارية للـ RK4 (تأخذ قيماً افتراضية إذا لم تكن موجودة في configs)
+        d_model = getattr(configs, 'd_model', 64)
+        rk4_steps = getattr(configs, 'rk4_steps', 4)
+
+        # 1. طبقة التقييس RevIN
+        self.revin = RevIN(num_features=enc_in)
+
+        # 2. طبقة التفكيك
         self.decomp = series_decomp(kernel_size)
 
-        # 1) المسار العام للاتجاه (الجزء الخطي الأساسي كما هو)
+        # 3. مسار الموسمية (خطي كما في DLinear)
+        self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
+        self.Linear_Seasonal.weight = nn.Parameter(
+            (1 / self.seq_len) * torch.ones([self.pred_len, self.seq_len])
+        )
+
+        # 4. مسار الاتجاه الهجين (خطي + RK4 في الفضاء الكامن)
         self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
         self.Linear_Trend.weight = nn.Parameter(
             (1 / self.seq_len) * torch.ones([self.pred_len, self.seq_len])
         )
 
-        # 2) التصحيح الديناميكي المتبقي فوق الاتجاه الخطي (RK4)
-        self.RK4_Trend_Correction = RK4ResidualCorrection(
-            pred_len=self.pred_len,
-            hidden_dim=rk4_hidden,
-            num_steps=rk4_steps
-        )
+        self.trend_encoder = nn.Linear(self.seq_len, d_model)
+        self.rk4_trend = RK4Block(d_model=d_model, num_steps=rk4_steps)
+        self.trend_decoder = nn.Linear(d_model, self.pred_len)
 
-        # 3) الموسمية في المجال الترددي المركب
-        self.Freq_Seasonal = ComplexFreqLinear(
-            self.seq_len, self.pred_len, self.enc_in, self.individual
-        )
+        # معامل قابل للتعلم للتحكم في وزن مساهمة RK4 (يبدأ صغيراً للاستقرار)
+        self.rk4_alpha = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, x):
-        # x: [Batch, seq_len, channels]
+        # x shape: [Batch, seq_len, channels]
+
+        # أ. التقييس
         x = self.revin(x, 'norm')
 
+        # ب. التفكيك
         seasonal_init, trend_init = self.decomp(x)
+
+        # ج. تبديل الأبعاد إلى [Batch, channels, seq_len]
         seasonal_init = seasonal_init.permute(0, 2, 1)
         trend_init = trend_init.permute(0, 2, 1)
 
-        # المسار الخطي العام + التصحيح الديناميكي غير الخطي عبر RK4
+        # د. التنبؤ بالموسمية
+        seasonal_output = self.Linear_Seasonal(seasonal_init)
+
+        # هـ. التنبؤ بالاتجاه (دمج المسار الخطي مع المسار التفاضلي RK4)
         trend_linear = self.Linear_Trend(trend_init)
-        trend_output = self.RK4_Trend_Correction(trend_linear)
+        
+        trend_latent = self.trend_encoder(trend_init)
+        trend_evolved = self.rk4_trend(trend_latent)
+        trend_rk4 = self.trend_decoder(trend_evolved)
 
-        seasonal_output = self.Freq_Seasonal(seasonal_init)
+        trend_output = trend_linear + self.rk4_alpha * trend_rk4
 
-        x_pred = (seasonal_output + trend_output).permute(0, 2, 1)
+        # و. دمج التنبؤات وإعادة الأبعاد
+        x_pred = seasonal_output + trend_output
+        x_pred = x_pred.permute(0, 2, 1)  # [Batch, pred_len, channels]
+
+        # ز. التقييس العكسي
         x_pred = self.revin(x_pred, 'denorm')
 
         return x_pred
