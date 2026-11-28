@@ -77,42 +77,36 @@ class series_decomp(nn.Module):
         return res, moving_mean
 
 
-# ==========================================
-# 3. دالة المعادلة التفاضلية وكتلة RK4
-# ==========================================
-class ODEFunc(nn.Module):
+class ChannelODEFunc(nn.Module):
     """
-    تمثل المشتقة dh/dt = f_theta(h) في الفضاء الكامن.
-    نستخدم دالة التفعيل Tanh لأنها ناعمة (Smooth) ومثالية للاستقرار العددي في RK4.
+    نمذجة التفاعل الديناميكي بين القنوات (المتغيرات) باستخدام معادلة تفاضلية خفيفة
     """
-    def __init__(self, d_model):
-        super(ODEFunc, self).__init__()
+    def __init__(self, enc_in, hidden_dim=32, dropout=0.2):
+        super(ChannelODEFunc, self).__init__()
         self.net = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.Tanh(),
-            nn.Linear(d_model, d_model)
+            nn.Linear(enc_in, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, enc_in)
         )
-        # تهيئة الأوزان بقيم صغيرة في البداية لضمان استقرار التكامل العددي
-        for m in self.net.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, mean=0, std=0.01)
-                nn.init.constant_(m.bias, val=0)
+        # تهيئة صغيرة لضمان بداية مستقرة
+        nn.init.normal_(self.net[-1].weight, mean=0, std=0.01)
+        nn.init.constant_(self.net[-1].bias, val=0)
 
     def forward(self, h):
         return self.net(h)
 
 
-class RK4Block(nn.Module):
-    """
-    كتلة التكامل العددي بطريقة رونج-كوتا من الرتبة الرابعة (Fixed-step RK4)
-    """
-    def __init__(self, d_model, num_steps=4):
-        super(RK4Block, self).__init__()
-        self.ode_func = ODEFunc(d_model)
+class ChannelRK4Block(nn.Module):
+    def __init__(self, enc_in, hidden_dim=32, num_steps=4, dropout=0.2):
+        super(ChannelRK4Block, self).__init__()
+        self.ode_func = ChannelODEFunc(enc_in, hidden_dim, dropout)
         self.num_steps = num_steps
-        self.dt = 1.0 / num_steps  # حجم الخطوة الزمنية
+        self.dt = 1.0 / num_steps
 
-    def forward(self, h):
+    def forward(self, x):
+        # x shape: [Batch, pred_len, enc_in]
+        h = x
         for _ in range(self.num_steps):
             k1 = self.ode_func(h)
             k2 = self.ode_func(h + 0.5 * self.dt * k1)
@@ -122,9 +116,6 @@ class RK4Block(nn.Module):
         return h
 
 
-# ==========================================
-# 4. النموذج المطور (RK4-DLinear + RevIN)
-# ==========================================
 class Model(nn.Module):
     def __init__(self, configs):
         super(Model, self).__init__()
@@ -133,65 +124,34 @@ class Model(nn.Module):
         enc_in = configs.enc_in
         kernel_size = 25
 
-        # معاملات اختيارية للـ RK4 (تأخذ قيماً افتراضية إذا لم تكن موجودة في configs)
-        d_model = getattr(configs, 'd_model', 128)
-        rk4_steps = getattr(configs, 'rk4_steps', 2)
-
-        # 1. طبقة التقييس RevIN
         self.revin = RevIN(num_features=enc_in)
-
-        # 2. طبقة التفكيك
         self.decomp = series_decomp(kernel_size)
 
-        # 3. مسار الموسمية (خطي كما في DLinear)
         self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
-        self.Linear_Seasonal.weight = nn.Parameter(
-            (1 / self.seq_len) * torch.ones([self.pred_len, self.seq_len])
-        )
-
-        # 4. مسار الاتجاه الهجين (خطي + RK4 في الفضاء الكامن)
         self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
-        self.Linear_Trend.weight = nn.Parameter(
-            (1 / self.seq_len) * torch.ones([self.pred_len, self.seq_len])
-        )
 
-        self.trend_encoder = nn.Linear(self.seq_len, d_model)
-        self.rk4_trend = RK4Block(d_model=d_model, num_steps=rk4_steps)
-        self.trend_decoder = nn.Linear(d_model, self.pred_len)
+        self.Linear_Seasonal.weight = nn.Parameter((1 / self.seq_len) * torch.ones([self.pred_len, self.seq_len]))
+        self.Linear_Trend.weight = nn.Parameter((1 / self.seq_len) * torch.ones([self.pred_len, self.seq_len]))
 
-        # معامل قابل للتعلم للتحكم في وزن مساهمة RK4 (يبدأ صغيراً للاستقرار)
-        self.rk4_alpha = nn.Parameter(torch.tensor(0.1))
+        # كتلة RK4 خفيفة لدمج القنوات بعد التنبؤ الزمني
+        self.channel_rk4 = ChannelRK4Block(enc_in=enc_in, hidden_dim=32, num_steps=4, dropout=0.2)
 
     def forward(self, x):
-        # x shape: [Batch, seq_len, channels]
-
-        # أ. التقييس
+        # x: [Batch, seq_len, channels]
         x = self.revin(x, 'norm')
 
-        # ب. التفكيك
         seasonal_init, trend_init = self.decomp(x)
-
-        # ج. تبديل الأبعاد إلى [Batch, channels, seq_len]
         seasonal_init = seasonal_init.permute(0, 2, 1)
         trend_init = trend_init.permute(0, 2, 1)
 
-        # د. التنبؤ بالموسمية
         seasonal_output = self.Linear_Seasonal(seasonal_init)
+        trend_output = self.Linear_Trend(trend_init)
 
-        # هـ. التنبؤ بالاتجاه (دمج المسار الخطي مع المسار التفاضلي RK4)
-        trend_linear = self.Linear_Trend(trend_init)
-        
-        trend_latent = self.trend_encoder(trend_init)
-        trend_evolved = self.rk4_trend(trend_latent)
-        trend_rk4 = self.trend_decoder(trend_evolved)
+        # دمج المكونين: [Batch, pred_len, channels]
+        x_pred = (seasonal_output + trend_output).permute(0, 2, 1)
 
-        trend_output = trend_linear + self.rk4_alpha * trend_rk4
+        # صقل التنبؤ عبر ديناميكيات التفاعل بين القنوات (RK4)
+        x_pred = self.channel_rk4(x_pred)
 
-        # و. دمج التنبؤات وإعادة الأبعاد
-        x_pred = seasonal_output + trend_output
-        x_pred = x_pred.permute(0, 2, 1)  # [Batch, pred_len, channels]
-
-        # ز. التقييس العكسي
         x_pred = self.revin(x_pred, 'denorm')
-
         return x_pred
