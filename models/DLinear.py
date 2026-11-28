@@ -89,6 +89,22 @@ class series_decomp(nn.Module):
 # 3. كتلة رونج-كوتا (Channel-Mixing RK4) للدورية
 # ==========================================
 class ChannelODEFunc(nn.Module):
+    """
+    نمذجة التفاعل الديناميكي غير الخطي بين القنوات (المتغيرات)
+    """
+    def __init__(self, enc_in, hidden_dim=32, dropout=0.2):
+        super(ChannelODEFunc, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(enc_in, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, enc_in)
+        )
+        # تهيئة صغيرة للطبقة الأخيرة لضمان بداية مستقرة للتكامل
+        nn.init.normal_(self.net[-1].weight, mean=0, std=0.01)
+        nn.init.constant_(self.net[-1].bias, val=0)
+
+    def forward(self, h):
         return self.net(h)
 
 
