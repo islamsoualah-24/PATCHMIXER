@@ -134,8 +134,8 @@ class Model(nn.Module):
         kernel_size = 25
 
         # معاملات اختيارية للـ RK4 (تأخذ قيماً افتراضية إذا لم تكن موجودة في configs)
-        d_model = getattr(configs, 'd_model', 64)
-        rk4_steps = getattr(configs, 'rk4_steps', 4)
+        d_model = getattr(configs, 'd_model', 128)
+        rk4_steps = getattr(configs, 'rk4_steps', 8)
 
         # 1. طبقة التقييس RevIN
         self.revin = RevIN(num_features=enc_in)
