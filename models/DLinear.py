@@ -135,7 +135,7 @@ class Model(nn.Module):
 
         # معاملات اختيارية للـ RK4 (تأخذ قيماً افتراضية إذا لم تكن موجودة في configs)
         d_model = getattr(configs, 'd_model', 128)
-        rk4_steps = getattr(configs, 'rk4_steps', 8)
+        rk4_steps = getattr(configs, 'rk4_steps', 2)
 
         # 1. طبقة التقييس RevIN
         self.revin = RevIN(num_features=enc_in)
