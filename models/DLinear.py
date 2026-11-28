@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.fft
 
 # ==========================================
 # 1. طبقة التقييس العكسي (RevIN)
@@ -29,8 +28,9 @@ class RevIN(nn.Module):
         self.affine_bias = nn.Parameter(torch.zeros(self.num_features))
 
     def _get_statistics(self, x):
-        self.mean = torch.mean(x, dim=1, keepdim=True).detach()
-        self.stdev = torch.sqrt(torch.var(x, dim=1, keepdim=True, unbiased=False) + self.eps).detach()
+        dim2reduce = tuple(range(1, x.ndim - 1))
+        self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
+        self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
 
     def _normalize(self, x):
         x = x - self.mean
@@ -79,64 +79,38 @@ class series_decomp(nn.Module):
 
 
 # ==========================================
-# 3. مكون التردد المركب (Complex Frequency Upsampling)
+# 3. مرشح فورييه الطيفي الخفيف (Lightweight Fourier Filter)
 # ==========================================
-class ComplexFreqLinear(nn.Module):
-    def __init__(self, seq_len, pred_len, enc_in, individual=False):
-        super(ComplexFreqLinear, self).__init__()
-        self.seq_len = seq_len
-        self.pred_len = pred_len
-        self.total_len = seq_len + pred_len
-        self.individual = individual
-        self.channels = enc_in
-
-        self.dominance_freq = seq_len // 2 + 1
-        self.length_ratio = self.total_len / self.seq_len
-
-        if self.individual:
-            self.freq_upsampler = nn.ModuleList([
-                nn.Linear(self.dominance_freq, int(self.dominance_freq * self.length_ratio)).to(torch.cfloat)
-                for _ in range(self.channels)
-            ])
-        else:
-            self.freq_upsampler = nn.Linear(
-                self.dominance_freq, int(self.dominance_freq * self.length_ratio)
-            ).to(torch.cfloat)
+class LightweightFourierFilter(nn.Module):
+    """
+    مرشح خفيف في المجال الترددي لتنقية الضوضاء وتعزيز الترددات الدورية
+    """
+    def __init__(self, seq_len, enc_in):
+        super(LightweightFourierFilter, self).__init__()
+        freq_bins = seq_len // 2 + 1
+        # تهيئة الأوزان المركبة عند (1 + 0j) لتبدأ كمرشح محايد تماماً
+        real = torch.ones(freq_bins, enc_in)
+        imag = torch.zeros(freq_bins, enc_in)
+        self.complex_weight = nn.Parameter(torch.stack([real, imag], dim=-1))
 
     def forward(self, x):
-        # x shape: [Batch, channels, seq_len]
-        low_specx = torch.fft.rfft(x, dim=-1)
-
-        if self.individual:
-            low_specxy_ = torch.zeros(
-                [low_specx.size(0), self.channels, int(self.dominance_freq * self.length_ratio)],
-                dtype=low_specx.dtype, device=low_specx.device
-            )
-            for i in range(self.channels):
-                low_specxy_[:, i, :] = self.freq_upsampler[i](low_specx[:, i, :])
-        else:
-            low_specxy_ = self.freq_upsampler(low_specx)
-
-        out_freq_dim = self.total_len // 2 + 1
-        low_specxy = torch.zeros(
-            [low_specxy_.size(0), low_specxy_.size(1), out_freq_dim],
-            dtype=low_specxy_.dtype, device=low_specxy_.device
-        )
-        min_len = min(low_specxy_.size(-1), out_freq_dim)
-        low_specxy[:, :, :min_len] = low_specxy_[:, :, :min_len]
-
-        low_xy = torch.fft.irfft(low_specxy, n=self.total_len, dim=-1)
-        low_xy = low_xy * self.length_ratio
-
-        pred_seasonal = low_xy[:, :, -self.pred_len:]
-        return pred_seasonal
+        # x shape: [Batch, seq_len, enc_in]
+        seq_len = x.shape[1]
+        # تحويل فورييه السريع على البعد الزمني
+        x_fft = torch.fft.rfft(x, dim=1, norm='ortho')
+        # تطبيق الأوزان المركبة القابلة للتعلم
+        weight = torch.view_as_complex(self.complex_weight)
+        x_fft = x_fft * weight.unsqueeze(0)
+        # التحويل العكسي للمجال الزمني
+        x_filtered = torch.fft.irfft(x_fft, n=seq_len, dim=1, norm='ortho')
+        return x_filtered
 
 
 # ==========================================
-# 4. كتلة رونج-كوتا الخفيفة بين القنوات (Channel-Mixing RK4)
+# 4. كتلة رونج-كوتا (Channel-Mixing RK4) للدورية
 # ==========================================
 class ChannelODEFunc(nn.Module):
-    def __init__(self, enc_in, hidden_dim=16, dropout=0.3):
+    def __init__(self, enc_in, hidden_dim=32, dropout=0.2):
         super(ChannelODEFunc, self).__init__()
         self.net = nn.Sequential(
             nn.Linear(enc_in, hidden_dim),
@@ -152,7 +126,7 @@ class ChannelODEFunc(nn.Module):
 
 
 class ChannelRK4Block(nn.Module):
-    def __init__(self, enc_in, hidden_dim=16, num_steps=4, dropout=0.3):
+    def __init__(self, enc_in, hidden_dim=32, num_steps=4, dropout=0.2):
         super(ChannelRK4Block, self).__init__()
         self.ode_func = ChannelODEFunc(enc_in, hidden_dim, dropout)
         self.num_steps = num_steps
@@ -171,37 +145,43 @@ class ChannelRK4Block(nn.Module):
 
 
 # ==========================================
-# 5. النموذج الكامل (Cascaded Freq-RK4 DLinear + RevIN)
+# 5. النموذج الكامل (Fourier-RK4 DLinear + RevIN)
 # ==========================================
 class Model(nn.Module):
     def __init__(self, configs):
         super(Model, self).__init__()
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
-        self.enc_in = configs.enc_in
-        self.individual = getattr(configs, 'individual', False)
+        enc_in = configs.enc_in
         kernel_size = 25
 
-        rk4_hidden = getattr(configs, 'rk4_hidden', 16)
+        rk4_hidden = getattr(configs, 'rk4_hidden', 32)
         rk4_steps = getattr(configs, 'rk4_steps', 4)
-        rk4_dropout = getattr(configs, 'dropout', 0.3)
+        rk4_dropout = getattr(configs, 'dropout', 0.2)
 
-        # 1. التقييس والتفكيك
-        self.revin = RevIN(num_features=self.enc_in)
+        # 1. طبقة التقييس RevIN
+        self.revin = RevIN(num_features=enc_in)
+
+        # 2. طبقة التفكيك
         self.decomp = series_decomp(kernel_size)
 
-        # 2. مسار الاتجاه (خطي بالكامل)
+        # 3. مرشح فورييه الخفيف لمكون الدورية
+        self.fourier_filter = LightweightFourierFilter(seq_len=self.seq_len, enc_in=enc_in)
+
+        # 4. الطبقات الخطية للتنبؤ الزمني
+        self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
         self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
+
+        self.Linear_Seasonal.weight = nn.Parameter(
+            (1 / self.seq_len) * torch.ones([self.pred_len, self.seq_len])
+        )
         self.Linear_Trend.weight = nn.Parameter(
             (1 / self.seq_len) * torch.ones([self.pred_len, self.seq_len])
         )
 
-        # 3. مسار الدورية التسلسلي: تردد مركب (زمن) -> ثم RK4 (قنوات)
-        self.Freq_Seasonal = ComplexFreqLinear(
-            self.seq_len, self.pred_len, self.enc_in, self.individual
-        )
+        # 5. كتلة RK4 لصقل مكون الدورية عبر القنوات
         self.channel_rk4 = ChannelRK4Block(
-            enc_in=self.enc_in,
+            enc_in=enc_in,
             hidden_dim=rk4_hidden,
             num_steps=rk4_steps,
             dropout=rk4_dropout
@@ -209,20 +189,28 @@ class Model(nn.Module):
 
     def forward(self, x):
         # x shape: [Batch, seq_len, channels]
+
+        # أ. التقييس
         x = self.revin(x, 'norm')
 
+        # ب. التفكيك إلى دورية واتجاه
         seasonal_init, trend_init = self.decomp(x)
-        seasonal_init = seasonal_init.permute(0, 2, 1)  # [Batch, channels, seq_len]
-        trend_init = trend_init.permute(0, 2, 1)        # [Batch, channels, seq_len]
 
-        # أ. الاتجاه (خطي)
-        trend_output = self.Linear_Trend(trend_init).permute(0, 2, 1)  # [Batch, pred_len, channels]
+        # ج. تنقية مكون الدورية في المجال الترددي (Fourier)
+        seasonal_init = self.fourier_filter(seasonal_init)
 
-        # ب. الدورية (تنبؤ في المجال الترددي المركب ثم صقل ديناميكي بين القنوات بـ RK4)
-        seasonal_output = self.Freq_Seasonal(seasonal_init).permute(0, 2, 1)
+        # د. تبديل الأبعاد إلى [Batch, channels, seq_len]
+        seasonal_init = seasonal_init.permute(0, 2, 1)
+        trend_init = trend_init.permute(0, 2, 1)
+
+        # هـ. مسار الاتجاه (خطي بالكامل)
+        trend_output = self.Linear_Trend(trend_init).permute(0, 2, 1)
+
+        # و. مسار الدورية (تنبؤ خطي + صقل ديناميكي عبر القنوات بـ RK4)
+        seasonal_output = self.Linear_Seasonal(seasonal_init).permute(0, 2, 1)
         seasonal_output = self.channel_rk4(seasonal_output)
 
-        # ج. الدمج النهائي والتقييس العكسي
+        # ز. الدمج والتقييس العكسي
         x_pred = seasonal_output + trend_output
         x_pred = self.revin(x_pred, 'denorm')
 
