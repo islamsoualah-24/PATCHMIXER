@@ -79,7 +79,7 @@ class series_decomp(nn.Module):
 
 
 # ==========================================
-# 3. الفرع الأول: المجال الترددي المركب (Complex Frequency Upsampling)
+# 3. مكون التردد المركب (Complex Frequency Upsampling)
 # ==========================================
 class ComplexFreqLinear(nn.Module):
     def __init__(self, seq_len, pred_len, enc_in, individual=False):
@@ -133,10 +133,10 @@ class ComplexFreqLinear(nn.Module):
 
 
 # ==========================================
-# 4. الفرع الثاني: الديناميكية المستمرة عبر القنوات (Channel-Mixing RK4)
+# 4. كتلة رونج-كوتا الخفيفة بين القنوات (Channel-Mixing RK4)
 # ==========================================
 class ChannelODEFunc(nn.Module):
-    def __init__(self, enc_in, hidden_dim=32, dropout=0.2):
+    def __init__(self, enc_in, hidden_dim=16, dropout=0.3):
         super(ChannelODEFunc, self).__init__()
         self.net = nn.Sequential(
             nn.Linear(enc_in, hidden_dim),
@@ -152,7 +152,7 @@ class ChannelODEFunc(nn.Module):
 
 
 class ChannelRK4Block(nn.Module):
-    def __init__(self, enc_in, hidden_dim=32, num_steps=4, dropout=0.2):
+    def __init__(self, enc_in, hidden_dim=16, num_steps=4, dropout=0.3):
         super(ChannelRK4Block, self).__init__()
         self.ode_func = ChannelODEFunc(enc_in, hidden_dim, dropout)
         self.num_steps = num_steps
@@ -171,7 +171,7 @@ class ChannelRK4Block(nn.Module):
 
 
 # ==========================================
-# 5. النموذج الهجين الكامل (Adaptive Freq-RK4 DLinear + RevIN)
+# 5. النموذج الكامل (Cascaded Freq-RK4 DLinear + RevIN)
 # ==========================================
 class Model(nn.Module):
     def __init__(self, configs):
@@ -182,9 +182,9 @@ class Model(nn.Module):
         self.individual = getattr(configs, 'individual', False)
         kernel_size = 25
 
-        rk4_hidden = getattr(configs, 'rk4_hidden', 32)
+        rk4_hidden = getattr(configs, 'rk4_hidden', 16)
         rk4_steps = getattr(configs, 'rk4_steps', 4)
-        rk4_dropout = getattr(configs, 'dropout', 0.2)
+        rk4_dropout = getattr(configs, 'dropout', 0.3)
 
         # 1. التقييس والتفكيك
         self.revin = RevIN(num_features=self.enc_in)
@@ -196,15 +196,9 @@ class Model(nn.Module):
             (1 / self.seq_len) * torch.ones([self.pred_len, self.seq_len])
         )
 
-        # 3. مسار الدورية - الفرع الترددي (Complex FFT)
+        # 3. مسار الدورية التسلسلي: تردد مركب (زمن) -> ثم RK4 (قنوات)
         self.Freq_Seasonal = ComplexFreqLinear(
             self.seq_len, self.pred_len, self.enc_in, self.individual
-        )
-
-        # 4. مسار الدورية - الفرع الزمني الديناميكي (Linear + RK4)
-        self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
-        self.Linear_Seasonal.weight = nn.Parameter(
-            (1 / self.seq_len) * torch.ones([self.pred_len, self.seq_len])
         )
         self.channel_rk4 = ChannelRK4Block(
             enc_in=self.enc_in,
@@ -212,9 +206,6 @@ class Model(nn.Module):
             num_steps=rk4_steps,
             dropout=rk4_dropout
         )
-
-        # 5. بوابة تكيفية قابلة للتعلم لكل قناة (تبدأ عند 0.5 عبر Sigmoid(0))
-        self.gate = nn.Parameter(torch.zeros(1, 1, self.enc_in))
 
     def forward(self, x):
         # x shape: [Batch, seq_len, channels]
@@ -224,21 +215,14 @@ class Model(nn.Module):
         seasonal_init = seasonal_init.permute(0, 2, 1)  # [Batch, channels, seq_len]
         trend_init = trend_init.permute(0, 2, 1)        # [Batch, channels, seq_len]
 
-        # أ. الاتجاه
+        # أ. الاتجاه (خطي)
         trend_output = self.Linear_Trend(trend_init).permute(0, 2, 1)  # [Batch, pred_len, channels]
 
-        # ب. الدورية - الفرع الترددي
-        seasonal_freq = self.Freq_Seasonal(seasonal_init).permute(0, 2, 1)  # [Batch, pred_len, channels]
+        # ب. الدورية (تنبؤ في المجال الترددي المركب ثم صقل ديناميكي بين القنوات بـ RK4)
+        seasonal_output = self.Freq_Seasonal(seasonal_init).permute(0, 2, 1)
+        seasonal_output = self.channel_rk4(seasonal_output)
 
-        # ج. الدورية - الفرع الزمني + RK4
-        seasonal_time = self.Linear_Seasonal(seasonal_init).permute(0, 2, 1)
-        seasonal_rk4 = self.channel_rk4(seasonal_time)
-
-        # د. الدمج التكيفي بين الفرعين لكل قناة
-        w = torch.sigmoid(self.gate)  # [1, 1, channels]
-        seasonal_output = w * seasonal_freq + (1.0 - w) * seasonal_rk4
-
-        # هـ. الدمج النهائي والتقييس العكسي
+        # ج. الدمج النهائي والتقييس العكسي
         x_pred = seasonal_output + trend_output
         x_pred = self.revin(x_pred, 'denorm')
 
