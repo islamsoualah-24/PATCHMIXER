@@ -81,7 +81,7 @@ class ChannelODEFunc(nn.Module):
     """
     نمذجة التفاعل الديناميكي بين القنوات (المتغيرات) باستخدام معادلة تفاضلية خفيفة
     """
-    def __init__(self, enc_in, hidden_dim=32, dropout=0.2):
+    def __init__(self, enc_in, hidden_dim=256, dropout=0.2):
         super(ChannelODEFunc, self).__init__()
         self.net = nn.Sequential(
             nn.Linear(enc_in, hidden_dim),
@@ -98,7 +98,7 @@ class ChannelODEFunc(nn.Module):
 
 
 class ChannelRK4Block(nn.Module):
-    def __init__(self, enc_in, hidden_dim=32, num_steps=4, dropout=0.2):
+    def __init__(self, enc_in, hidden_dim=256, num_steps=4, dropout=0.2):
         super(ChannelRK4Block, self).__init__()
         self.ode_func = ChannelODEFunc(enc_in, hidden_dim, dropout)
         self.num_steps = num_steps
