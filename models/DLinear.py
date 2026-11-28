@@ -137,21 +137,22 @@ class Model(nn.Module):
         self.channel_rk4 = ChannelRK4Block(enc_in=enc_in, hidden_dim=32, num_steps=4, dropout=0.2)
 
     def forward(self, x):
-        # x: [Batch, seq_len, channels]
-        x = self.revin(x, 'norm')
-
-        seasonal_init, trend_init = self.decomp(x)
-        seasonal_init = seasonal_init.permute(0, 2, 1)
-        trend_init = trend_init.permute(0, 2, 1)
-
-        seasonal_output = self.Linear_Seasonal(seasonal_init)
-        trend_output = self.Linear_Trend(trend_init)
-
-        # دمج المكونين: [Batch, pred_len, channels]
-        x_pred = (seasonal_output + trend_output).permute(0, 2, 1)
-
-        # صقل التنبؤ عبر ديناميكيات التفاعل بين القنوات (RK4)
-        x_pred = self.channel_rk4(x_pred)
-
-        x_pred = self.revin(x_pred, 'denorm')
+            # x: [Batch, seq_len, channels]
+            x = self.revin(x, 'norm')
+    
+            seasonal_init, trend_init = self.decomp(x)
+            seasonal_init = seasonal_init.permute(0, 2, 1)
+            trend_init = trend_init.permute(0, 2, 1)
+    
+            # 1. مسار الاتجاه (يبقى خطياً بالكامل للاستقرار)
+            trend_output = self.Linear_Trend(trend_init).permute(0, 2, 1) # [Batch, pred_len, channels]
+    
+            # 2. مسار الدورية (خطي + صقل ديناميكي عبر القنوات بـ RK4)
+            seasonal_output = self.Linear_Seasonal(seasonal_init).permute(0, 2, 1) # [Batch, pred_len, channels]
+            seasonal_output = self.channel_rk4(seasonal_output)
+    
+            # 3. الدمج والتقييس العكسي
+            x_pred = seasonal_output + trend_output
+            x_pred = self.revin(x_pred, 'denorm')
+            
         return x_pred
